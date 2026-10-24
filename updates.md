@@ -2,6 +2,19 @@
 
 Changelog of what has been built, newest first. The sequence and status of each phase is in [plan.md](plan.md).
 
+## Phase 2: test bench and baseline (2026-10-24)
+
+Goal: measure accuracy and delay of the engine alone, in real time, for English and Japanese.
+
+- [bench/prepare.py](bench/prepare.py): builds the test set from Google FLEURS (`en_us`, `ja_jp`, CC-BY-4.0): 10 recordings per language, 3 sentences each with short pauses, fixed seed. [bench/manifest.csv](bench/manifest.csv) holds the reference text; the audio is git-ignored and rebuilt by the script.
+- [bench/replay.py](bench/replay.py): streams one recording at real speed in 100 ms chunks, followed by 6 s of silence, and logs every message with its arrival time. Also samples the engine's `backlog_seconds` once a second.
+- [bench/score.py](bench/score.py): builds the transcript, computes WER (English) and CER (Japanese) with normalisation, and the delays: first draft, draft lag, finished-segment delay.
+- [bench/run_bench.py](bench/run_bench.py): runs the whole set several times and writes raw events and a summary table to `bench/results/` (git-ignored). Scoring can be redone from the raw events with `score.py`.
+- Added a draft-lag metric after the first smoke run showed that "final delay" mostly measures WhisperLive's rule that a sentence is finished only when the next one starts.
+- Baseline, `base` model, one seat ([bench/BASELINE.md](bench/BASELINE.md)): English 12.05% WER, Japanese 30.22% CER; median draft lag about 1 s but the backlog reaches 13 s on some long sentences.
+- [README.md](README.md): setup, usage (files, microphone, RTSP/HLS and raw WebSocket streams), settings and troubleshooting.
+- `.gitignore`: ignores `bench/data/` (downloaded FLEURS files).
+
 ## Phase 1: speech engine in a container (2026-10-24)
 
 Goal: one container that loads a model from the model store at start, warms it up, says when it is ready, and exposes a backlog meter.

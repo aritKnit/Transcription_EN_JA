@@ -38,12 +38,12 @@ Check (passed): `docker compose up -d engine`; `/ready` went 503 to 200 after wa
 
 How to run it: `cp .env.example .env`, `docker compose up -d engine`, then `curl localhost:8000/ready` and `curl localhost:8000/health`. Settings (model folder, seats, threads, caps) live in `.env`.
 
-## Phase 2: Test bench `[ ]`
+## Phase 2: Test bench `[x]`
 - `bench/`: replay a WAV at real speed over the websocket (soundfile + soxr to 16 kHz mono).
-- Log timestamps for first draft, final text and end of audio. Score English WER and Mandarin CER (jiwer), three repeats, mean and std (pandas, scipy).
-- Test set of about 10 recordings per language with reference text.
+- Log timestamps for first draft, draft lag and finished segments. Score English WER and Japanese CER (jiwer), three repeats, mean and std (pandas, scipy). Japanese replaced Mandarin as the second language.
+- Test set: 10 recordings per language (3 FLEURS sentences each) with reference text.
 
-Check: baseline numbers for delay, WER and CER. Every later change is compared against these.
+Check (passed): baseline in [bench/BASELINE.md](bench/BASELINE.md): English 12.05% WER, Japanese 30.22% CER with the `base` model; the engine falls behind on some long sentences (backlog up to 13 s). Every later change is compared against these.
 
 ## Phase 3: Redis and the message board `[ ]`
 - `redis:7` in Compose, append-only file, volume.
