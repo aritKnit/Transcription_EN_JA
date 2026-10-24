@@ -69,6 +69,8 @@ class ServeClientBase(object):
         self.timestamp_offset = 0.0
         self.frames_np = None
         self.frames_offset = 0.0
+        # end of the audio the latest transcription pass was given, for backlog_seconds()
+        self.last_pass_end_s = 0.0
         self.text = []
         self.current_out = ""
         self.prev_out = ""
@@ -132,6 +134,7 @@ class ServeClientBase(object):
                 self.clip_audio_if_no_valid_segment()
 
             input_bytes, duration = self.get_audio_chunk_for_processing()
+            self.last_pass_end_s = self.timestamp_offset + duration
             if duration < 1.0:
                 self.frames_ready.clear()
                 self.frames_ready.wait(timeout=self.AUDIO_WAIT_TIMEOUT_S)
@@ -158,6 +161,19 @@ class ServeClientBase(object):
                 logging.error(f"[ERROR]: Failed to transcribe audio chunk: {e}")
                 wl_metrics.track_error("transcription")
                 time.sleep(self.ERROR_BACKOFF_S)
+
+    def backlog_seconds(self):
+        """
+        Seconds of received audio that no transcription pass has looked at yet.
+
+        Stays near zero while the engine keeps up and grows when passes take longer
+        than the audio they cover.
+        """
+        with self.lock:
+            if self.frames_np is None:
+                return 0.0
+            received_s = self.frames_offset + self.frames_np.shape[0] / self.RATE
+        return max(0.0, received_s - self.last_pass_end_s)
 
     def transcribe_audio(self, input_sample):
         raise NotImplementedError

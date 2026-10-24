@@ -3,12 +3,76 @@ import json
 import logging
 import threading
 import time
+import numpy as np
 import torch
 import ctranslate2
 from huggingface_hub import snapshot_download
 
 from whisper_live.transcriber.transcriber_faster_whisper import WhisperModel
 from whisper_live.backend.base import ServeClientBase
+
+
+MODEL_SIZES = [
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large-v2", "large-v3", "distil-small.en",
+    "distil-medium.en", "distil-large-v2", "distil-large-v3",
+    "large-v3-turbo", "turbo"
+]
+
+
+def select_device():
+    """Return the ``(device, compute_type)`` faster-whisper runs with on this machine."""
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability("cuda")
+        return "cuda", "float16" if major >= 7 else "float32"
+    return "cpu", "int8"
+
+
+def load_model(model_ref, device, compute_type, cache_path):
+    """
+    Load a faster-whisper model from a stock size name, a CTranslate2 folder or a
+    Hugging Face model id. A Hugging Face model that is not in CTranslate2 format is
+    converted into ``cache_path`` first.
+    """
+    if model_ref in MODEL_SIZES:
+        model_to_load = model_ref
+    else:
+        logging.info(f"Model not in model_sizes")
+        if os.path.isdir(model_ref) and ctranslate2.contains_model(model_ref):
+            model_to_load = model_ref
+        else:
+            local_snapshot = snapshot_download(
+                repo_id = model_ref,
+                repo_type = "model",
+            )
+            if ctranslate2.contains_model(local_snapshot):
+                model_to_load = local_snapshot
+            else:
+                cache_root = os.path.expanduser(os.path.join(cache_path, "whisper-ct2-models/"))
+                os.makedirs(cache_root, exist_ok=True)
+                safe_name = model_ref.replace("/", "--")
+                ct2_dir = os.path.join(cache_root, safe_name)
+
+                if not ctranslate2.contains_model(ct2_dir):
+                    logging.info(f"Converting '{model_ref}' to CTranslate2 @ {ct2_dir}")
+                    ct2_converter = ctranslate2.converters.TransformersConverter(
+                        local_snapshot,
+                        copy_files=["tokenizer.json", "preprocessor_config.json"]
+                    )
+                    ct2_converter.convert(
+                        output_dir=ct2_dir,
+                        quantization=compute_type,
+                        force=False,  # skip if already up-to-date
+                    )
+                model_to_load = ct2_dir
+
+    logging.info(f"Loading model: {model_to_load}")
+    return WhisperModel(
+        model_to_load,
+        device=device,
+        compute_type=compute_type,
+        local_files_only=False,
+    )
 
 
 class ServeClientFasterWhisper(ServeClientBase):
@@ -75,12 +139,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             word_timestamps,
         )
         self.cache_path = cache_path
-        self.model_sizes = [
-            "tiny", "tiny.en", "base", "base.en", "small", "small.en",
-            "medium", "medium.en", "large-v2", "large-v3", "distil-small.en",
-            "distil-medium.en", "distil-large-v2", "distil-large-v3",
-            "large-v3-turbo", "turbo"
-        ]
+        self.model_sizes = MODEL_SIZES
 
         self.model_size_or_path = model
         self.language = "en" if self.model_size_or_path.endswith("en") else language
@@ -89,12 +148,7 @@ class ServeClientFasterWhisper(ServeClientBase):
         self.vad_parameters = vad_parameters or {"threshold": 0.5}
         self.hotwords = hotwords
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device == "cuda":
-            major, _ = torch.cuda.get_device_capability(device)
-            self.compute_type = "float16" if major >= 7 else "float32"
-        else:
-            self.compute_type = "int8"
+        device, self.compute_type = select_device()
 
         if self.model_size_or_path is None:
             return
@@ -140,47 +194,33 @@ class ServeClientFasterWhisper(ServeClientBase):
         Instantiates a new model, sets it as the transcriber. If model is a huggingface model_id
         then it is automatically converted to ctranslate2(faster_whisper) format.
         """
-        model_ref = self.model_size_or_path
-
-        if model_ref in self.model_sizes:
-            model_to_load = model_ref
-        else:
-            logging.info(f"Model not in model_sizes")
-            if os.path.isdir(model_ref) and ctranslate2.contains_model(model_ref):
-                model_to_load = model_ref
-            else:
-                local_snapshot = snapshot_download(
-                    repo_id = model_ref,
-                    repo_type = "model",
-                )
-                if ctranslate2.contains_model(local_snapshot):
-                    model_to_load = local_snapshot
-                else:
-                    cache_root = os.path.expanduser(os.path.join(self.cache_path, "whisper-ct2-models/"))
-                    os.makedirs(cache_root, exist_ok=True)
-                    safe_name = model_ref.replace("/", "--")
-                    ct2_dir = os.path.join(cache_root, safe_name)
-
-                    if not ctranslate2.contains_model(ct2_dir):
-                        logging.info(f"Converting '{model_ref}' to CTranslate2 @ {ct2_dir}")
-                        ct2_converter = ctranslate2.converters.TransformersConverter(
-                            local_snapshot, 
-                            copy_files=["tokenizer.json", "preprocessor_config.json"]
-                        )
-                        ct2_converter.convert(
-                            output_dir=ct2_dir,
-                            quantization=self.compute_type,
-                            force=False,  # skip if already up-to-date
-                        )
-                    model_to_load = ct2_dir
-
-        logging.info(f"Loading model: {model_to_load}")
-        self.transcriber = WhisperModel(
-            model_to_load,
-            device=device,
-            compute_type=self.compute_type,
-            local_files_only=False,
+        self.transcriber = load_model(
+            self.model_size_or_path, device, self.compute_type, self.cache_path
         )
+
+    @classmethod
+    def preload(cls, model, cache_path="~/.cache/whisper-live/"):
+        """
+        Load the shared model and run it once on silence, so the first client does not
+        wait for the model load or for the first slow inference pass.
+
+        Args:
+            model (str): Stock model size, CTranslate2 folder or Hugging Face model id.
+            cache_path (str, optional): Where auto-converted models are cached.
+        """
+        device, compute_type = select_device()
+        with cls.SINGLE_MODEL_LOCK:
+            if cls.SINGLE_MODEL is None:
+                cls.SINGLE_MODEL = load_model(model, device, compute_type, cache_path)
+            transcriber = cls.SINGLE_MODEL
+        silence = np.zeros(2 * cls.RATE, dtype=np.float32)
+        t0 = time.time()
+        # one pass without VAD runs the decoder, one with VAD warms the VAD session
+        for use_vad in (False, True):
+            result, _ = transcriber.transcribe(silence, language="en", vad_filter=use_vad)
+            # no speech in the silence comes back as None
+            list(result or [])
+        logging.info(f"Model warm-up took {time.time() - t0:.1f}s")
 
     def set_language(self, info):
         """

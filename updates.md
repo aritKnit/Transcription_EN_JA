@@ -1,0 +1,39 @@
+# Updates
+
+Changelog of what has been built, newest first. The sequence and status of each phase is in [plan.md](plan.md).
+
+## Phase 1: speech engine in a container (2026-10-24)
+
+Goal: one container that loads a model from the model store at start, warms it up, says when it is ready, and exposes a backlog meter.
+
+### WhisperLive (extended in place)
+- `--preload` flag in [run_server.py](WhisperLive/run_server.py). Loads the `-fw` model and runs it once on silence before the WebSocket port opens, so the first session does not wait for a model load.
+- `/ready` endpoint in [server.py](WhisperLive/whisper_live/server.py): 503 until the model is warm, then 200. It needs no API key. `/health` stays as the liveness check and now also reports `ready` and `backlog_seconds`.
+- Backlog meter: `ServeClientBase.backlog_seconds()` in [base.py](WhisperLive/whisper_live/backend/base.py) counts received audio that no transcription pass has looked at yet. `ClientManager.backlog_seconds()` sums it over clients, and [metrics.py](WhisperLive/whisper_live/metrics.py) exposes it as the Prometheus gauge `whisperlive_backlog_seconds`.
+- [faster_whisper_backend.py](WhisperLive/whisper_live/backend/faster_whisper_backend.py): model loading moved out of `create_model` into shared module functions (`select_device`, `load_model`) and a `ServeClientFasterWhisper.preload()` classmethod. Behaviour for normal clients is unchanged.
+- Existing behaviour reused as is: the seat check already answers a refused client with `{"status": "WAIT", "message": <minutes>}`, and `--max_clients`, `--max_connection_time`, `--omp_num_threads` and `--metrics_port` already existed.
+- Tests: updated the `/health` test and added tests for `/ready`, the per-client backlog and the summed backlog (199 passing across the base-backend, server and metrics test files).
+
+### New files
+- [engine/Dockerfile](engine/Dockerfile) and [engine/requirements.txt](engine/requirements.txt): Python 3.11, CPU-only torch, only the faster-whisper path. Built from the repo root. Runs as a non-root user.
+- [docker-compose.yml](docker-compose.yml): the `engine` service with the model folder mounted read-only, CPU and memory caps, a health check on `/ready`, and `restart: unless-stopped`.
+- [.env.example](.env.example): model folder, seats, session limit, threads and caps. Copy to `.env`.
+- [.dockerignore](.dockerignore): keeps the venv, models and git history out of the build context.
+- [plan.md](plan.md): the phased build plan for the HLD.
+- `models/base-v1/`: `Systran/faster-whisper-base` (git-ignored). INT8 is applied when it loads.
+
+### Verified
+- `/ready` went 503 to 200 after warm-up; the container reports healthy.
+- A second client got `WAIT` while the first stayed connected.
+
+### Fixed along the way
+- `faster-whisper` imports `requests` without declaring it; added `requests` and `huggingface_hub` to the engine requirements.
+- The warm-up crashed because the transcriber returns `None` when it finds no speech; it now handles that.
+
+### Known limits
+- First image build took about 23 minutes (downloads); rebuilds after code changes take seconds.
+- This machine has about 6 GB of RAM, so the engine is capped at 2 GB and 4 CPUs.
+
+## Phase 0: layout and decisions (2026-10-24)
+- Monorepo folders: `WhisperLive/`, `engine/`, `gateway/`, `frontend/`, `worker-template/`, `monitoring/`, `models/`.
+- Decisions: Python 3.11 for every backend image; one shared message shape (defined in Phase 3); one `.env` per deployment; the SenseVoice backend is parked.

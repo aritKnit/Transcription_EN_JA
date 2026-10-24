@@ -1,0 +1,13 @@
+.git
+.vscode
+.claude
+models
+WhisperLive/whisper_env
+WhisperLive/.git
+WhisperLive/Audio-Transcription-*
+WhisperLive/docs
+WhisperLive/assets
+WhisperLive/tests
+**/__pycache__
+**/node_modules
+frontend/dist

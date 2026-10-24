@@ -45,7 +45,7 @@ STOCK_MODEL_SIZES = frozenset({
 })
 
 # REST routes that stay reachable without an API key.
-API_KEY_EXEMPT_PATHS = frozenset({"/docs", "/redoc", "/openapi.json", "/health"})
+API_KEY_EXEMPT_PATHS = frozenset({"/docs", "/redoc", "/openapi.json", "/health", "/ready"})
 
 # Subprotocol a browser offers as `new WebSocket(url, ["bearer", token])`.
 BEARER_SUBPROTOCOL = "bearer"
@@ -144,6 +144,12 @@ class ClientManager:
             self.start_times.pop(websocket, None)
         if client:
             client.cleanup()
+
+    def backlog_seconds(self):
+        """Seconds of received audio not yet looked at by transcription, summed over clients."""
+        with self.lock:
+            clients = list(self.clients.values())
+        return sum(client.backlog_seconds() for client in clients)
 
     def get_wait_time(self):
         """
@@ -266,6 +272,7 @@ class TranscriptionServer:
         self.default_model = "small"
         self.rest_models = {}
         self.rest_models_lock = threading.Lock()
+        self.ready = threading.Event()
 
     def initialize_client(
         self, websocket, options, faster_whisper_custom_model_path,
@@ -871,9 +878,17 @@ class TranscriptionServer:
                 "status": "ok",
                 "backend": backend,
                 "model": health_model,
+                "ready": self.ready.is_set(),
                 "clients": len(self.client_manager.clients),
                 "max_clients": self.client_manager.max_clients,
+                "backlog_seconds": round(self.client_manager.backlog_seconds(), 3),
             }
+
+        @app.get("/ready")
+        async def ready():
+            """200 once the model is loaded and warm, 503 before that."""
+            is_ready = self.ready.is_set()
+            return JSONResponse({"ready": is_ready}, status_code=200 if is_ready else 503)
 
         @app.post("/v1/audio/transcriptions")
         async def transcribe(
@@ -1035,7 +1050,8 @@ class TranscriptionServer:
             segment_post_processor=None,
             transcript_finalizer=None,
             audio_preprocessor=None,
-            default_model: str = "small"):
+            default_model: str = "small",
+            preload: bool = False):
         """
         Run the transcription server.
 
@@ -1086,6 +1102,9 @@ class TranscriptionServer:
                 when the request's ``model`` field is ``whisper-1`` or absent.
                 Defaults to "small". A custom model passed with
                 ``faster_whisper_custom_model_path`` takes precedence.
+            preload (bool): Load and warm up the model passed with
+                ``faster_whisper_custom_model_path`` before accepting WebSocket
+                clients. ``/ready`` answers 503 until that finishes. Defaults to False.
         """
         self.cache_path = cache_path
         self.raw_pcm_input = raw_pcm_input
@@ -1147,6 +1166,7 @@ class TranscriptionServer:
         # Start Prometheus metrics endpoint if port is specified
         if metrics_port > 0:
             wl_metrics.start_metrics_server(metrics_port)
+        wl_metrics.set_backlog_provider(self.client_manager.backlog_seconds)
 
         # New OpenAI-compatible REST API (toggleable via enable_rest boolean)
         if enable_rest:
@@ -1166,6 +1186,14 @@ class TranscriptionServer:
                 daemon=True
             ).start()
             logging.info(f"✅ OpenAI-Compatible API started on http://0.0.0.0:{rest_port}")
+
+        if preload:
+            if backend == BackendType.FASTER_WHISPER.value and faster_whisper_custom_model_path:
+                from whisper_live.backend.faster_whisper_backend import ServeClientFasterWhisper
+                ServeClientFasterWhisper.preload(faster_whisper_custom_model_path, cache_path)
+            else:
+                logging.warning("--preload needs the faster_whisper backend and -fw; skipping.")
+        self.ready.set()
 
         # Original WebSocket server (always supported)
         extra_ws_kwargs = {"select_subprotocol": _select_bearer_subprotocol}

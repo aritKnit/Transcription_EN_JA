@@ -53,6 +53,10 @@ try:
         "Total errors by type",
         ["type"],
     )
+    BACKLOG_SECONDS = Gauge(
+        "whisperlive_backlog_seconds",
+        "Seconds of received audio not yet looked at by a transcription pass, summed over clients",
+    )
     BATCH_FALLBACK_ITEMS = Counter(
         "whisperlive_batch_fallback_items_total",
         "Batched items re-decoded at a higher temperature after failing the quality check",
@@ -83,6 +87,12 @@ def start_metrics_server(port=9091):
         logging.info(f"Prometheus metrics available at http://0.0.0.0:{port}/metrics")
     except Exception as e:
         logging.error(f"Failed to start metrics server: {e}")
+
+
+def set_backlog_provider(provider):
+    """Report ``provider()`` as the backlog gauge each time Prometheus scrapes it."""
+    if _AVAILABLE:
+        BACKLOG_SECONDS.set_function(provider)
 
 
 def track_connection_opened():

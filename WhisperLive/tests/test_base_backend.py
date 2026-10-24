@@ -685,6 +685,34 @@ class TestFinalize(unittest.TestCase):
         client.websocket.send.assert_not_called()
 
 
+
+class TestBacklogSeconds(unittest.TestCase):
+    def _client(self):
+        return ConcreteServeClient(client_uid="test", websocket=MagicMock())
+
+    def test_zero_before_any_audio(self):
+        self.assertEqual(self._client().backlog_seconds(), 0.0)
+
+    def test_counts_audio_no_pass_has_looked_at(self):
+        client = self._client()
+        client.add_frames(np.zeros(3 * client.RATE, dtype=np.float32))
+        self.assertAlmostEqual(client.backlog_seconds(), 3.0)
+
+    def test_audio_seen_by_the_latest_pass_is_not_backlog(self):
+        client = self._client()
+        client.add_frames(np.zeros(3 * client.RATE, dtype=np.float32))
+        client.last_pass_end_s = 3.0
+        client.add_frames(np.zeros(client.RATE, dtype=np.float32))
+        self.assertAlmostEqual(client.backlog_seconds(), 1.0)
+
+    def test_counts_from_the_trimmed_buffer_start(self):
+        client = self._client()
+        client.frames_offset = 30.0
+        client.add_frames(np.zeros(2 * client.RATE, dtype=np.float32))
+        client.last_pass_end_s = 31.0
+        self.assertAlmostEqual(client.backlog_seconds(), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

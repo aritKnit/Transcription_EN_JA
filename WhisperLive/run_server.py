@@ -116,6 +116,11 @@ if __name__ == "__main__":
         default=0,
         help='Maximum REST API requests per minute per client IP. 0 = unlimited (default).'
     )
+    parser.add_argument(
+        '--preload',
+        action='store_true',
+        help='Load and warm up the -fw model before accepting clients. /ready returns 503 until done.'
+    )
     args = parser.parse_args()
 
     if args.backend == "tensorrt":
@@ -150,4 +155,5 @@ if __name__ == "__main__":
         api_key=args.api_key,
         rate_limit_rpm=args.rate_limit_rpm,
         default_model=args.default_model,
+        preload=args.preload,
     )

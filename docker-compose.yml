@@ -1,0 +1,33 @@
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: engine/Dockerfile
+    command:
+      - python
+      - run_server.py
+      - --port=9090
+      - --backend=faster_whisper
+      - --faster_whisper_custom_model_path=/models/${MODEL_DIR}
+      - --preload
+      - --max_clients=${MAX_CLIENTS:-1}
+      - --max_connection_time=${MAX_CONNECTION_TIME:-3600}
+      - --omp_num_threads=${ENGINE_THREADS:-4}
+      - --enable_rest
+      - --rest_port=8000
+      - --metrics_port=9091
+    volumes:
+      - ./models:/models:ro
+    ports:
+      # for testing from the host; the gateway reaches the engine over the compose network
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    cpus: ${ENGINE_CPUS:-4}
+    mem_limit: ${ENGINE_MEM:-2g}
+    restart: unless-stopped

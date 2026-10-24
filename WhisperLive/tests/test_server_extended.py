@@ -879,7 +879,9 @@ class TestHealthEndpoint(unittest.TestCase):
 
     def test_health_reports_backend_model_and_clients(self):
         client = self._make_client()
-        self.server.client_manager.add_client(MagicMock(), MagicMock())
+        session = MagicMock()
+        session.backlog_seconds.return_value = 1.5
+        self.server.client_manager.add_client(MagicMock(), session)
         resp = client.get("/health")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
@@ -888,10 +890,34 @@ class TestHealthEndpoint(unittest.TestCase):
                 "status": "ok",
                 "backend": "faster_whisper",
                 "model": "small",
+                "ready": False,
                 "clients": 1,
                 "max_clients": 3,
+                "backlog_seconds": 1.5,
             },
         )
+
+    def test_ready_is_503_until_the_model_is_warm(self):
+        client = self._make_client()
+        resp = client.get("/ready")
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.json(), {"ready": False})
+        self.server.ready.set()
+        resp = client.get("/ready")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), {"ready": True})
+
+    def test_ready_needs_no_api_key(self):
+        client = self._make_client(api_key="test-secret")
+        self.assertEqual(client.get("/ready").status_code, 503)
+
+    def test_client_manager_sums_backlog_over_clients(self):
+        manager = ClientManager(max_clients=3, max_connection_time=60)
+        for seconds in (0.5, 2.0):
+            session = MagicMock()
+            session.backlog_seconds.return_value = seconds
+            manager.add_client(MagicMock(), session)
+        self.assertEqual(manager.backlog_seconds(), 2.5)
 
     def test_health_reports_default_model_override(self):
         from fastapi.testclient import TestClient
