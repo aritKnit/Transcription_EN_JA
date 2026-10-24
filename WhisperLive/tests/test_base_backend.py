@@ -1,0 +1,716 @@
+import json
+import queue
+import threading
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+from websockets.exceptions import ConnectionClosed
+
+from whisper_live.backend.base import ServeClientBase
+
+
+class ConcreteServeClient(ServeClientBase):
+    """Concrete subclass for testing the abstract base class."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.language = "en"
+
+    def transcribe_audio(self, input_sample):
+        return None
+
+    def handle_transcription_output(self, result, duration):
+        pass
+
+
+class WaitTrackingEvent:
+    """Threading event that records when wait() is entered."""
+
+    def __init__(self):
+        self._event = threading.Event()
+        self.wait_started = threading.Event()
+
+    def wait(self, timeout=None):
+        self.wait_started.set()
+        return self._event.wait(timeout)
+
+    def set(self):
+        self._event.set()
+
+    def __getattr__(self, name):
+        return getattr(self._event, name)
+
+
+class TestServeClientBaseInit(unittest.TestCase):
+    def test_default_values(self):
+        ws = MagicMock()
+        client = ConcreteServeClient(client_uid="test-uid", websocket=ws)
+        self.assertEqual(client.client_uid, "test-uid")
+        self.assertEqual(client.send_last_n_segments, 10)
+        self.assertAlmostEqual(client.no_speech_thresh, 0.45)
+        self.assertFalse(client.clip_audio)
+        self.assertEqual(client.same_output_threshold, 10)
+        self.assertIsNone(client.frames_np)
+        self.assertAlmostEqual(client.timestamp_offset, 0.0)
+        self.assertFalse(client.exit)
+        self.assertEqual(client.transcript, [])
+
+    def test_custom_values(self):
+        ws = MagicMock()
+        q = queue.Queue()
+        client = ConcreteServeClient(
+            client_uid="uid2",
+            websocket=ws,
+            send_last_n_segments=5,
+            no_speech_thresh=0.6,
+            clip_audio=True,
+            same_output_threshold=20,
+            translation_queue=q,
+        )
+        self.assertEqual(client.send_last_n_segments, 5)
+        self.assertAlmostEqual(client.no_speech_thresh, 0.6)
+        self.assertTrue(client.clip_audio)
+        self.assertEqual(client.same_output_threshold, 20)
+        self.assertIs(client.translation_queue, q)
+
+
+class TestAddFrames(unittest.TestCase):
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(client_uid="test", websocket=self.ws)
+
+    def test_first_frame_initializes_buffer(self):
+        frame = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+        self.client.add_frames(frame)
+        np.testing.assert_array_equal(self.client.frames_np, frame)
+
+    def test_subsequent_frames_concatenated(self):
+        frame1 = np.array([0.1, 0.2], dtype=np.float32)
+        frame2 = np.array([0.3, 0.4], dtype=np.float32)
+        self.client.add_frames(frame1)
+        self.client.add_frames(frame2)
+        expected = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        np.testing.assert_array_equal(self.client.frames_np, expected)
+
+    def test_buffer_trimmed_at_45_seconds(self):
+        # 45 seconds + 1 sample at 16kHz = 720001 samples
+        self.client.frames_np = np.zeros(45 * 16000 + 1, dtype=np.float32)
+        self.client.add_frames(np.array([1.0], dtype=np.float32))
+        # after trimming 30s, buffer should be ~15s + 1 original + 1 new
+        expected_len = (45 * 16000 + 1) - (30 * 16000) + 1
+        self.assertEqual(self.client.frames_np.shape[0], expected_len)
+        self.assertAlmostEqual(self.client.frames_offset, 30.0)
+
+    def test_timestamp_offset_updated_on_trim(self):
+        self.client.frames_np = np.zeros(45 * 16000 + 1, dtype=np.float32)
+        self.client.timestamp_offset = 5.0  # behind frames_offset after trim
+        self.client.add_frames(np.array([1.0], dtype=np.float32))
+        # timestamp_offset should be bumped to at least frames_offset
+        self.assertGreaterEqual(self.client.timestamp_offset, self.client.frames_offset)
+
+class TestAddFramesThreadSafety(unittest.TestCase):
+    def test_concurrent_add_frames(self):
+        ws = MagicMock()
+        client = ConcreteServeClient(client_uid="test", websocket=ws)
+        errors = []
+
+        def add_many():
+            try:
+                for _ in range(100):
+                    client.add_frames(np.random.randn(160).astype(np.float32))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=add_many) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(client.frames_np)
+
+    def test_exception_releases_lock_without_signaling_frames_ready(self):
+        ws = MagicMock()
+        client = ConcreteServeClient(client_uid="test", websocket=ws)
+        client.frames_np = np.array([0.1], dtype=np.float32)
+
+        with patch("whisper_live.backend.base.np.concatenate", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                client.add_frames(np.array([0.2], dtype=np.float32))
+
+        self.assertFalse(client.lock.locked())
+        self.assertFalse(client.frames_ready.is_set())
+
+
+class TestGetAudioChunkForProcessing(unittest.TestCase):
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(client_uid="test", websocket=self.ws)
+
+    def test_empty_buffer_returns_empty(self):
+        self.client.frames_np = np.array([], dtype=np.float32)
+        chunk, duration = self.client.get_audio_chunk_for_processing()
+        self.assertEqual(duration, 0.0)
+        self.assertEqual(chunk.shape[0], 0)
+
+    def test_full_buffer_no_offset(self):
+        audio = np.random.randn(16000).astype(np.float32)  # 1 second
+        self.client.frames_np = audio
+        chunk, duration = self.client.get_audio_chunk_for_processing()
+        self.assertAlmostEqual(duration, 1.0)
+        np.testing.assert_array_equal(chunk, audio)
+
+    def test_with_offset(self):
+        audio = np.random.randn(32000).astype(np.float32)  # 2 seconds
+        self.client.frames_np = audio
+        self.client.timestamp_offset = 1.0  # skip first second
+        chunk, duration = self.client.get_audio_chunk_for_processing()
+        self.assertAlmostEqual(duration, 1.0)
+        self.assertEqual(chunk.shape[0], 16000)
+
+
+class TestClipAudioIfNoValidSegment(unittest.TestCase):
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(
+            client_uid="test", websocket=self.ws, clip_audio=True
+        )
+
+    def test_clips_when_chunk_exceeds_25s(self):
+        # 30 seconds of audio with no valid segments
+        self.client.frames_np = np.zeros(30 * 16000, dtype=np.float32)
+        self.client.timestamp_offset = 0.0
+        self.client.frames_offset = 0.0
+        self.client.clip_audio_if_no_valid_segment()
+        # offset should have advanced to leave ~5s of remaining audio
+        expected_offset = (30 * 16000 / 16000) - 5
+        self.assertAlmostEqual(self.client.timestamp_offset, expected_offset, places=1)
+
+    def test_no_clip_when_short(self):
+        self.client.frames_np = np.zeros(10 * 16000, dtype=np.float32)
+        self.client.timestamp_offset = 0.0
+        self.client.frames_offset = 0.0
+        self.client.clip_audio_if_no_valid_segment()
+        self.assertAlmostEqual(self.client.timestamp_offset, 0.0)
+
+
+class TestPrepareSegments(unittest.TestCase):
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(
+            client_uid="test", websocket=self.ws, send_last_n_segments=3
+        )
+
+    def test_empty_transcript_no_last(self):
+        segments = self.client.prepare_segments()
+        self.assertEqual(segments, [])
+
+    def test_empty_transcript_with_last(self):
+        last = {"start": "0.000", "end": "1.000", "text": "hello", "completed": False}
+        segments = self.client.prepare_segments(last_segment=last)
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["text"], "hello")
+
+    def test_fewer_than_n_segments(self):
+        self.client.transcript = [
+            {"start": "0.000", "end": "1.000", "text": "a", "completed": True},
+            {"start": "1.000", "end": "2.000", "text": "b", "completed": True},
+        ]
+        segments = self.client.prepare_segments()
+        self.assertEqual(len(segments), 2)
+
+    def test_more_than_n_segments_truncated(self):
+        self.client.transcript = [
+            {"start": f"{i}.000", "end": f"{i+1}.000", "text": f"seg{i}", "completed": True}
+            for i in range(10)
+        ]
+        segments = self.client.prepare_segments()
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(segments[0]["text"], "seg7")
+
+    def test_last_segment_appended(self):
+        self.client.transcript = [
+            {"start": "0.000", "end": "1.000", "text": "a", "completed": True},
+        ]
+        last = {"start": "1.000", "end": "2.000", "text": "in progress", "completed": False}
+        segments = self.client.prepare_segments(last_segment=last)
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[-1]["text"], "in progress")
+
+
+class TestFormatSegment(unittest.TestCase):
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(client_uid="test", websocket=self.ws)
+
+    def test_format(self):
+        seg = self.client.format_segment(1.234, 5.678, "hello world", completed=True)
+        self.assertEqual(seg["start"], "1.234")
+        self.assertEqual(seg["end"], "5.678")
+        self.assertEqual(seg["text"], "hello world")
+        self.assertTrue(seg["completed"])
+
+    def test_format_not_completed(self):
+        seg = self.client.format_segment(0.0, 1.0, "text")
+        self.assertFalse(seg["completed"])
+
+
+class TestSendTranscriptionToClient(unittest.TestCase):
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(client_uid="test-uid", websocket=self.ws)
+
+    def test_sends_json(self):
+        segments = [{"start": "0.000", "end": "1.000", "text": "hi", "completed": True}]
+        self.client.send_transcription_to_client(segments)
+        self.ws.send.assert_called_once()
+        sent = json.loads(self.ws.send.call_args[0][0])
+        self.assertEqual(sent["uid"], "test-uid")
+        self.assertEqual(len(sent["segments"]), 1)
+
+    def test_send_failure_logged_not_raised(self):
+        self.ws.send.side_effect = ConnectionError("broken pipe")
+        # should not raise
+        self.client.send_transcription_to_client([])
+
+
+class TestDisconnect(unittest.TestCase):
+    def test_sends_disconnect_message(self):
+        ws = MagicMock()
+        client = ConcreteServeClient(client_uid="uid1", websocket=ws)
+        client.disconnect()
+        sent = json.loads(ws.send.call_args[0][0])
+        self.assertEqual(sent["uid"], "uid1")
+        self.assertEqual(sent["message"], "DISCONNECT")
+
+
+class TestCleanup(unittest.TestCase):
+    def test_sets_exit_flag(self):
+        ws = MagicMock()
+        client = ConcreteServeClient(client_uid="uid1", websocket=ws)
+        self.assertFalse(client.exit)
+        client.cleanup()
+        self.assertTrue(client.exit)
+
+
+def _supports_thread_time():
+    thread_time = getattr(time, "thread_time", None)
+    if thread_time is None:
+        return False
+    try:
+        thread_time()
+    except NotImplementedError:
+        return False
+    return True
+
+class TestSpeechToTextWaitingBehavior(unittest.TestCase):
+    """Tests the first-frame wait behavior in speech_to_text()."""
+
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(client_uid="test", websocket=self.ws)
+        self.client.frames_ready = WaitTrackingEvent()
+        self.transcribe_called = threading.Event()
+        self.thread_started = threading.Event()
+        self.cpu_used = None
+        self.thread = None
+
+    def tearDown(self):
+        if self.thread is not None and self.thread.is_alive():
+            self.client.exit = True
+            # release wait() directly so a broken cleanup() cannot hang the test process
+            self.client.frames_ready.set()
+            self.thread.join(timeout=1.0)
+
+    def _start_speech_thread(self, target=None):
+        self.thread = threading.Thread(target=target or self.client.speech_to_text)
+        self.thread.start()
+        return self.thread
+
+    def _join_speech_thread(self):
+        self.thread.join(timeout=1.0)
+        return not self.thread.is_alive()
+
+    def _transcribe_once(self, input_sample):
+        # mark the first processing step after wait and stop the loop
+        self.transcribe_called.set()
+        self.client.exit = True
+        return []
+
+    def _measure_waiting_cpu(self):
+        # measure CPU consumed by speech_to_text loop while it waits for the first frame
+        self.thread_started.set()
+        start_cpu = time.thread_time()
+        self.client.speech_to_text()
+        self.cpu_used = time.thread_time() - start_cpu
+
+    def test_waits_for_first_frame_before_transcribing(self):
+        self.client.transcribe_audio = MagicMock(side_effect=self._transcribe_once)
+        self._start_speech_thread()
+        self.assertTrue(self.client.frames_ready.wait_started.wait(timeout=1.0))
+        self.assertFalse(self.transcribe_called.is_set())
+
+        self.client.add_frames(np.zeros(self.client.RATE, dtype=np.float32))
+
+        self.assertTrue(self.transcribe_called.wait(timeout=1.0))
+        self.assertTrue(self._join_speech_thread())
+
+    def test_cleanup_unblocks_waiting_thread_without_audio(self):
+        self.client.transcribe_audio = MagicMock()
+        self._start_speech_thread()
+        self.assertTrue(self.client.frames_ready.wait_started.wait(timeout=1.0))
+
+        self.client.cleanup()
+
+        self.assertTrue(self._join_speech_thread())
+        self.assertTrue(self.client.exit)
+        self.client.transcribe_audio.assert_not_called()
+
+    def test_exit_flag_unblocks_waiting_thread_without_signal(self):
+        self.client.transcribe_audio = MagicMock()
+        self._start_speech_thread()
+        self.assertTrue(self.client.frames_ready.wait_started.wait(timeout=1.0))
+
+        self.client.exit = True
+
+        self.assertTrue(self._join_speech_thread())
+        self.client.transcribe_audio.assert_not_called()
+
+    @unittest.skipUnless(_supports_thread_time(), "time.thread_time() not supported")
+    def test_waiting_for_first_frame_uses_negligible_thread_cpu(self):
+        self._start_speech_thread(target=self._measure_waiting_cpu)
+        self.assertTrue(self.thread_started.wait(timeout=1.0))
+
+        time.sleep(0.25)
+        self.client.cleanup()
+
+        self.assertTrue(self._join_speech_thread())
+        self.assertIsNotNone(self.cpu_used)
+        self.assertLess(self.cpu_used, 0.1)
+
+
+class TestTrimTranscript(unittest.TestCase):
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(client_uid="test", websocket=self.ws)
+
+    def test_transcript_trimmed_when_over_max(self):
+        self.client.transcript = [
+            {"start": f"{i}.000", "end": f"{i+1}.000", "text": f"seg{i}", "completed": True}
+            for i in range(self.client.MAX_TRANSCRIPT_LENGTH + 100)
+        ]
+        self.client._trim_transcript()
+        self.assertEqual(len(self.client.transcript), self.client.MAX_TRANSCRIPT_LENGTH)
+        self.assertEqual(self.client.transcript[0]["text"], "seg100")
+
+    def test_transcript_not_trimmed_when_under_max(self):
+        self.client.transcript = [
+            {"start": "0.000", "end": "1.000", "text": "a", "completed": True}
+        ]
+        self.client._trim_transcript()
+        self.assertEqual(len(self.client.transcript), 1)
+
+    def test_text_list_trimmed(self):
+        self.client.text = ["word"] * (self.client.MAX_TRANSCRIPT_LENGTH + 50)
+        self.client._trim_transcript()
+        self.assertEqual(len(self.client.text), self.client.MAX_TRANSCRIPT_LENGTH)
+
+
+class TestUpdateSegments(unittest.TestCase):
+    """Tests for the core update_segments() logic."""
+
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(
+            client_uid="test",
+            websocket=self.ws,
+            no_speech_thresh=0.45,
+            same_output_threshold=3,
+        )
+        self.client.frames_np = np.zeros(16000 * 5, dtype=np.float32)
+
+    def _make_segment(self, start, end, text, no_speech_prob=0.0):
+        seg = MagicMock()
+        seg.start = start
+        seg.end = end
+        seg.text = text
+        seg.no_speech_prob = no_speech_prob
+        return seg
+
+    def test_single_segment_becomes_last(self):
+        segs = [self._make_segment(0.0, 1.0, " hello")]
+        last = self.client.update_segments(segs, duration=2.0)
+        self.assertIsNotNone(last)
+        self.assertIn("hello", last["text"])
+        self.assertFalse(last["completed"])
+        self.assertEqual(len(self.client.transcript), 0)
+
+    def test_multiple_segments_completes_all_but_last(self):
+        segs = [
+            self._make_segment(0.0, 1.0, " first"),
+            self._make_segment(1.0, 2.0, " second"),
+        ]
+        last = self.client.update_segments(segs, duration=3.0)
+        self.assertEqual(len(self.client.transcript), 1)
+        self.assertTrue(self.client.transcript[0]["completed"])
+        self.assertIn("first", self.client.transcript[0]["text"])
+        self.assertIsNotNone(last)
+        self.assertIn("second", last["text"])
+
+    def test_high_no_speech_prob_skipped(self):
+        segs = [
+            self._make_segment(0.0, 1.0, " noise", no_speech_prob=0.9),
+            self._make_segment(1.0, 2.0, " also noise", no_speech_prob=0.9),
+        ]
+        last = self.client.update_segments(segs, duration=3.0)
+        self.assertEqual(len(self.client.transcript), 0)
+        self.assertIsNone(last)
+
+    def test_segment_with_start_gte_end_skipped(self):
+        segs = [
+            self._make_segment(1.0, 0.5, " backwards"),
+            self._make_segment(1.5, 2.0, " normal"),
+        ]
+        last = self.client.update_segments(segs, duration=3.0)
+        self.assertEqual(len(self.client.transcript), 0)
+        self.assertIsNotNone(last)
+
+    def test_repeated_output_triggers_completion(self):
+        seg = self._make_segment(0.0, 1.0, " repeated")
+        for _ in range(self.client.same_output_threshold + 2):
+            last = self.client.update_segments([seg], duration=2.0)
+        # after enough repeats, should be added to transcript
+        self.assertTrue(len(self.client.transcript) >= 1)
+
+    def test_translation_queue_receives_completed(self):
+        q = queue.Queue()
+        self.client.translation_queue = q
+        segs = [
+            self._make_segment(0.0, 1.0, " first"),
+            self._make_segment(1.0, 2.0, " second"),
+        ]
+        self.client.update_segments(segs, duration=3.0)
+        self.assertFalse(q.empty())
+        item = q.get_nowait()
+        self.assertIn("first", item["text"])
+
+    def test_timestamp_offset_advances(self):
+        segs = [
+            self._make_segment(0.0, 1.0, " first"),
+            self._make_segment(1.0, 2.0, " second"),
+        ]
+        self.client.update_segments(segs, duration=3.0)
+        self.assertGreater(self.client.timestamp_offset, 0.0)
+
+
+class TestGetSegmentHelpers(unittest.TestCase):
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(client_uid="test", websocket=self.ws)
+
+    def test_get_segment_no_speech_prob_attr(self):
+        seg = MagicMock()
+        seg.no_speech_prob = 0.3
+        self.assertAlmostEqual(self.client.get_segment_no_speech_prob(seg), 0.3)
+
+    def test_get_segment_no_speech_prob_fallback(self):
+        seg = MagicMock(spec=[])  # no attributes
+        self.assertEqual(self.client.get_segment_no_speech_prob(seg), 0)
+
+    def test_get_segment_start_uses_start(self):
+        seg = MagicMock()
+        seg.start = 1.5
+        self.assertAlmostEqual(self.client.get_segment_start(seg), 1.5)
+
+    def test_get_segment_end_uses_end(self):
+        seg = MagicMock()
+        seg.end = 3.0
+        self.assertAlmostEqual(self.client.get_segment_end(seg), 3.0)
+
+    def test_get_segment_start_fallback_to_start_ts(self):
+        seg = MagicMock(spec=["start_ts"])
+        seg.start_ts = 2.0
+        self.assertAlmostEqual(self.client.get_segment_start(seg), 2.0)
+
+
+class TestWordTimestamps(unittest.TestCase):
+    """Tests for word-level timestamp extraction."""
+
+    def _make_client(self, word_timestamps=False):
+        ws = MagicMock()
+        return ConcreteServeClient(
+            client_uid="wt-uid", websocket=ws, word_timestamps=word_timestamps
+        )
+
+    def _make_word(self, word, start, end, prob):
+        w = MagicMock()
+        w.word = word
+        w.start = start
+        w.end = end
+        w.probability = prob
+        return w
+
+    def _make_segment(self, text, start, end, no_speech_prob=0.0, words=None):
+        seg = MagicMock()
+        seg.text = text
+        seg.start = start
+        seg.end = end
+        seg.no_speech_prob = no_speech_prob
+        seg.words = words
+        return seg
+
+    def test_word_timestamps_disabled_by_default(self):
+        client = self._make_client()
+        self.assertFalse(client.word_timestamps)
+
+    def test_word_timestamps_enabled(self):
+        client = self._make_client(word_timestamps=True)
+        self.assertTrue(client.word_timestamps)
+
+    def test_extract_words_when_disabled(self):
+        client = self._make_client(word_timestamps=False)
+        seg = self._make_segment("hello", 0.0, 1.0, words=[self._make_word("hello", 0.0, 0.5, 0.99)])
+        result = client._extract_words(seg, 0.0)
+        self.assertIsNone(result)
+
+    def test_extract_words_when_enabled(self):
+        client = self._make_client(word_timestamps=True)
+        words = [
+            self._make_word("hello", 0.0, 0.3, 0.95),
+            self._make_word("world", 0.4, 0.8, 0.88),
+        ]
+        seg = self._make_segment("hello world", 0.0, 1.0, words=words)
+        result = client._extract_words(seg, 10.0)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["word"], "hello")
+        self.assertEqual(result[0]["start"], "10.000")
+        self.assertEqual(result[0]["end"], "10.300")
+        self.assertEqual(result[0]["probability"], 0.95)
+        self.assertEqual(result[1]["word"], "world")
+        self.assertEqual(result[1]["start"], "10.400")
+
+    def test_extract_words_no_words_on_segment(self):
+        client = self._make_client(word_timestamps=True)
+        seg = self._make_segment("hello", 0.0, 1.0, words=None)
+        result = client._extract_words(seg, 0.0)
+        self.assertIsNone(result)
+
+    def test_format_segment_without_words(self):
+        client = self._make_client()
+        seg = client.format_segment(0.0, 1.0, "hello")
+        self.assertNotIn("words", seg)
+
+    def test_format_segment_with_words(self):
+        client = self._make_client(word_timestamps=True)
+        words = [{"word": "hello", "start": "0.000", "end": "0.500", "probability": 0.95}]
+        seg = client.format_segment(0.0, 1.0, "hello", words=words)
+        self.assertIn("words", seg)
+        self.assertEqual(len(seg["words"]), 1)
+        self.assertEqual(seg["words"][0]["word"], "hello")
+
+    def test_update_segments_includes_words(self):
+        client = self._make_client(word_timestamps=True)
+        words1 = [self._make_word("hello", 0.0, 0.5, 0.9)]
+        words2 = [self._make_word("world", 0.6, 1.0, 0.85)]
+        segments = [
+            self._make_segment(" hello", 0.0, 0.5, words=words1),
+            self._make_segment(" world", 0.6, 1.0, words=words2),
+        ]
+        last = client.update_segments(segments, 2.0)
+        # First segment should be completed (in transcript) with words
+        self.assertTrue(len(client.transcript) > 0)
+        self.assertIn("words", client.transcript[-1])
+        # Last segment should be in-progress with words
+        self.assertIsNotNone(last)
+        self.assertIn("words", last)
+
+    def test_update_segments_no_words_when_disabled(self):
+        client = self._make_client(word_timestamps=False)
+        words1 = [self._make_word("hello", 0.0, 0.5, 0.9)]
+        words2 = [self._make_word("world", 0.6, 1.0, 0.85)]
+        segments = [
+            self._make_segment(" hello", 0.0, 0.5, words=words1),
+            self._make_segment(" world", 0.6, 1.0, words=words2),
+        ]
+        last = client.update_segments(segments, 2.0)
+        self.assertTrue(len(client.transcript) > 0)
+        self.assertNotIn("words", client.transcript[-1])
+        self.assertNotIn("words", last)
+
+
+class TestFinalize(unittest.TestCase):
+    def _client(self):
+        client = ConcreteServeClient(client_uid="uid", websocket=MagicMock())
+        client.transcript = [{"start": 0.0, "end": 1.0, "text": "hi"}]
+        return client
+
+    def test_no_finalizer_sends_nothing(self):
+        client = self._client()
+        client.finalize()
+        client.websocket.send.assert_not_called()
+
+    def test_finalizer_payload_is_sent_with_uid(self):
+        client = self._client()
+        client.transcript_finalizer = lambda transcript: {"paragraphs": ["hi"]}
+        client.finalize()
+        client.websocket.send.assert_called_once()
+        sent = json.loads(client.websocket.send.call_args[0][0])
+        self.assertEqual(sent["uid"], "uid")
+        self.assertEqual(sent["paragraphs"], ["hi"])
+
+    def test_finalizer_receives_transcript(self):
+        seen = {}
+        client = self._client()
+
+        def finalizer(transcript):
+            seen["t"] = transcript
+            return None
+
+        client.transcript_finalizer = finalizer
+        client.finalize()
+        self.assertEqual(seen["t"], client.transcript)
+        client.websocket.send.assert_not_called()  # None -> nothing sent
+
+    def test_finalizer_exception_is_swallowed(self):
+        client = self._client()
+
+        def boom(transcript):
+            raise RuntimeError("nope")
+
+        client.transcript_finalizer = boom
+        client.finalize()  # must not raise
+        client.websocket.send.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestSendTranscriptionToClient(unittest.TestCase):
+    """A client that hangs up mid-send is a normal disconnect, not an error."""
+
+    def setUp(self):
+        self.ws = MagicMock()
+        self.client = ConcreteServeClient(client_uid="test", websocket=self.ws)
+        self.segments = [{"start": "0.0", "end": "1.0", "text": "hello", "completed": True}]
+
+    def test_segments_reach_the_client(self):
+        self.client.send_transcription_to_client(self.segments)
+        sent = json.loads(self.ws.send.call_args[0][0])
+        self.assertEqual(sent["uid"], "test")
+        self.assertEqual(sent["segments"], self.segments)
+
+    def test_a_client_that_hung_up_is_not_logged_as_an_error(self):
+        self.ws.send.side_effect = ConnectionClosed(None, None)
+        with self.assertLogs(level="INFO") as captured:
+            self.client.send_transcription_to_client(self.segments)
+        self.assertFalse(any(line.startswith("ERROR") for line in captured.output))
+
+    def test_a_real_send_failure_is_still_an_error(self):
+        self.ws.send.side_effect = RuntimeError("socket exploded")
+        with self.assertLogs(level="ERROR") as captured:
+            self.client.send_transcription_to_client(self.segments)
+        self.assertTrue(any("socket exploded" in line for line in captured.output))
