@@ -1,0 +1,70 @@
+# Secrets and per-deployment settings (keep a committed .env.example instead)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+whisper_env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.svelte-kit/
+frontend/.vite/
+*.tsbuildinfo
+
+# Models and data (large; use DVC or a download script instead)
+models/*
+!models/.gitkeep
+!models/README.md
+*.bin
+*.onnx
+*.gguf
+*.safetensors
+*.pt
+*.ct2/
+.cache/
+
+# Recordings and bench outputs (consented audio goes through DVC, not git)
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.flac
+bench/results/
+bench/audio/
+*.srt
+output*
+
+# DVC
+/.dvc/cache
+/.dvc/tmp
+
+# Docker / runtime data
+redis-data/
+prometheus-data/
+grafana-data/
+docker-compose.override.yml
+
+# Logs
+*.log
+
+# Editors and OS
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+.claude/
