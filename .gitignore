@@ -68,3 +68,6 @@ docker-compose.override.yml
 .DS_Store
 Thumbs.db
 .claude/
+
+# Bench: downloaded FLEURS parquet files
+bench/data/

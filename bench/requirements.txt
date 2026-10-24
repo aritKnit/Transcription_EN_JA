@@ -1,0 +1,10 @@
+# Test bench: replays recordings against the engine and scores the result.
+websockets
+soundfile
+soxr
+jiwer
+pandas
+scipy
+pyarrow
+huggingface_hub
+whisper-normalizer
