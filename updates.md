@@ -2,6 +2,13 @@
 
 Changelog of what has been built, newest first. The sequence and status of each phase is in [plan.md](plan.md).
 
+## Experiment: Redis on the live pipeline (2026-10-25, branch `experiment/redis-live`)
+
+- [experiments/redis_live/](experiments/redis_live/README.md): `bridge.py` sends the microphone (or a WAV file at real speed) to the engine and publishes each finished sentence to the real `final-text` feed with `publish(msg)`, standing in for the Phase 4 gateway; `watch.py` reads `final-text` as its own consumer group and shows each sentence as it arrives, with its time in Redis; `cleanup.py` removes the experiment's sentences afterwards.
+- Checked by replaying English and Japanese recordings: sentences published in 1 to 4 ms and arrived 2 to 5 ms later; a watcher killed with `kill -9` and restarted received what was published while it was down; a Redis restart mid-session cost two retries; with Redis stopped for 13 s the bridge reported the sentence it could not publish and carried on.
+- Finding for Phase 4: sentences finished while Redis is down never reach the feed. For translation and add-ons to catch up after an outage, the gateway must keep them and publish them when Redis is back.
+- Not on `main`. A real-microphone run is left to the person running it.
+
 ## Phase 3 requirements met to the letter, and the plan's check run (2026-10-25)
 
 Checked each Phase 3 item literally and closed two gaps:
