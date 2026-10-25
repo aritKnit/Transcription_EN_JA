@@ -27,7 +27,7 @@ def run_consumer(board, feed, group, consumer, count, seconds=10, ack=False, **k
     kwargs.setdefault("block_ms", 200)
     out = []
     try:
-        for delivery in board.consume(feed, group, consumer, stop=stop, **kwargs):
+        for delivery in board.consume(group, consumer, feed=feed, stop=stop, **kwargs):
             out.append(delivery)
             if ack:
                 delivery.ack()

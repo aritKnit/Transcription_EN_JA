@@ -47,7 +47,7 @@ class BackgroundConsumer:
 
     def _run(self, board, feed, group, name, kwargs):
         try:
-            for delivery in board.consume(feed, group, name, stop=self.stop, **kwargs):
+            for delivery in board.consume(group, name, feed=feed, stop=self.stop, **kwargs):
                 with self._lock:
                     self.handled.append((delivery.message.session, delivery.message.segment))
                 try:
@@ -83,26 +83,26 @@ class ProxyCase(RedisCase):
 class TestRedisFailures(ProxyCase):
     def test_publish_fails_fast_while_redis_is_down_and_works_again_after(self):
         board = self.proxied()
-        board.publish(self.feed, message(0))
+        board.publish(message(0), feed=self.feed)
         self.proxy.down()
         started = time.monotonic()
         with self.assertRaises(FeedUnavailable):
-            board.publish(self.feed, message(1))
+            board.publish(message(1), feed=self.feed)
         self.assertLess(time.monotonic() - started, 1.5, "publish must not stall the caller")
         self.proxy.up()
-        board.publish(self.feed, message(2))
+        board.publish(message(2), feed=self.feed)
         self.assertEqual(self.board.client.xlen(self.feed), 2)
 
     def test_publish_gives_up_within_its_timeout_when_redis_hangs(self):
         board = self.proxied(socket_timeout=1.0)
-        board.publish(self.feed, message(0))
+        board.publish(message(0), feed=self.feed)
         self.proxy.silent()
         started = time.monotonic()
         with self.assertRaises(FeedUnavailable):
-            board.publish(self.feed, message(1))
+            board.publish(message(1), feed=self.feed)
         self.assertLess(time.monotonic() - started, 2.5, "publish must give up after about one socket timeout")
         self.proxy.up()
-        board.publish(self.feed, message(2))
+        board.publish(message(2), feed=self.feed)
         # The timed-out publish may still reach Redis once the connection drains; a consumer skips the repeat
         # and sees each message at most once.
         got = segments(self.consume(3, ack=True, seconds=2))
@@ -114,7 +114,7 @@ class TestRedisFailures(ProxyCase):
         consumer = BackgroundConsumer(self.proxied(socket_timeout=2.0), self.feed)
         try:
             for i in range(200):
-                self.board.publish(self.feed, message(i))
+                self.board.publish(message(i), feed=self.feed)
                 if i % 20 == 10:
                     self.proxy.cut()
                 time.sleep(0.005)
@@ -131,10 +131,10 @@ class TestRedisFailures(ProxyCase):
     def test_a_consumer_waits_out_a_hung_redis_and_carries_on(self):
         consumer = BackgroundConsumer(self.proxied(socket_timeout=1.0), self.feed)
         try:
-            self.board.publish(self.feed, message(1))
+            self.board.publish(message(1), feed=self.feed)
             self.assertTrue(wait_until(lambda: consumer.segments() == [1], 5))
             self.proxy.silent()
-            self.board.publish(self.feed, message(2))     # published while the consumer's link hangs
+            self.board.publish(message(2), feed=self.feed)     # published while the consumer's link hangs
             time.sleep(2.5)
             self.proxy.up()
             self.assertTrue(wait_until(lambda: 2 in consumer.segments(), 15), "message 2 never arrived")
@@ -146,7 +146,7 @@ class TestRedisFailures(ProxyCase):
         board = self.proxied(socket_timeout=1.0)
         self.proxy.down()
         stop = threading.Event()
-        thread = threading.Thread(target=lambda: list(board.consume(self.feed, "g", "c", block_ms=300, stop=stop)))
+        thread = threading.Thread(target=lambda: list(board.consume("g", "c", feed=self.feed, block_ms=300, stop=stop)))
         thread.start()
         time.sleep(4)                                     # long enough for the retry wait to have grown
         stop.set()
@@ -157,7 +157,7 @@ class TestRedisFailures(ProxyCase):
 
     def test_ack_during_an_outage_raises_feed_unavailable_and_the_message_comes_back(self):
         board = self.proxied(socket_timeout=1.0)
-        self.board.publish(self.feed, message(1))
+        self.board.publish(message(1), feed=self.feed)
         [delivery] = run_consumer(board, self.feed, "g", "c1", 1, start="0")
         self.proxy.down()
         with self.assertRaises(FeedUnavailable):
@@ -174,7 +174,7 @@ class TestRedisFailures(ProxyCase):
             with self.subTest(reply=reply.split()[0]):
                 with patch.object(self.board.client, "xadd", side_effect=redis.ResponseError(reply)):
                     with self.assertRaises(FeedUnavailable):
-                        self.board.publish(self.feed, message(1))
+                        self.board.publish(message(1), feed=self.feed)
 
     def test_a_consumer_waits_while_redis_is_loading_or_full_and_carries_on(self):
         # after a restart Redis answers LOADING until its data is read back; when full it refuses writes
@@ -184,7 +184,7 @@ class TestRedisFailures(ProxyCase):
             with self.subTest(reply=reply.split()[0]):
                 feed = f"{self.feed}-{reply.split()[0]}"
                 self.addCleanup(self.board.client.delete, feed)
-                self.board.publish(feed, message(1))
+                self.board.publish(message(1), feed=feed)
                 real, calls = self.board.client.xreadgroup, {"n": 0}
 
                 def refusing(*args, **kwargs):
@@ -198,7 +198,7 @@ class TestRedisFailures(ProxyCase):
                 self.assertEqual(segments(got), [1])
 
     def test_ack_while_redis_is_full_raises_feed_unavailable(self):
-        self.board.publish(self.feed, message(1))
+        self.board.publish(message(1), feed=self.feed)
         [delivery] = self.consume(1)
         with patch.object(self.board.client, "pipeline", side_effect=redis.ResponseError("OOM command not allowed")):
             with self.assertRaises(FeedUnavailable):
@@ -211,7 +211,7 @@ class TestRedisFailures(ProxyCase):
     def test_a_feed_name_used_by_something_else_is_an_error_not_an_outage(self):
         self.board.client.set(self.feed, "not a stream")
         with self.assertRaises(redis.ResponseError) as caught:
-            self.board.publish(self.feed, message(1))
+            self.board.publish(message(1), feed=self.feed)
         self.assertNotIsInstance(caught.exception, FeedUnavailable)
 
 
@@ -224,7 +224,7 @@ class TestConcurrency(RedisCase):
 
         def publish(p):
             for i in range(per):
-                self.board.publish(self.feed, message(i, session=f"pub-{p}"))
+                self.board.publish(message(i, session=f"pub-{p}"), feed=self.feed)
 
         threads = [threading.Thread(target=publish, args=(p,)) for p in range(publishers)]
         try:
@@ -246,7 +246,7 @@ class TestConcurrency(RedisCase):
     def test_one_consumer_sees_each_publishers_messages_in_order(self):
         def publish(p):
             for i in range(200):
-                self.board.publish(self.feed, message(i, session=f"pub-{p}"))
+                self.board.publish(message(i, session=f"pub-{p}"), feed=self.feed)
 
         threads = [threading.Thread(target=publish, args=(p,)) for p in range(4)]
         for t in threads:
@@ -263,7 +263,7 @@ class TestConcurrency(RedisCase):
 
     def test_twenty_groups_each_see_every_message_in_order(self):
         for i in range(100):
-            self.board.publish(self.feed, message(i))
+            self.board.publish(message(i), feed=self.feed)
         for g in range(20):
             self.assertEqual(segments(self.consume(100, group=f"group-{g}", ack=True)), list(range(100)))
 
@@ -279,7 +279,7 @@ class TestChaos(RedisCase):
     def test_workers_killed_at_random_still_handle_every_message(self):
         total, key, names = 300, f"handled-{self.feed}", ["w0", "w1", "w2"]
         for i in range(total):
-            self.board.publish(self.feed, message(i))
+            self.board.publish(message(i), feed=self.feed)
         handled = lambda: [int(x) for x in self.board.client.lrange(key, 0, -1)]
         workers = {name: self.start_worker(name, key) for name in names}
         rng, kills = random.Random(7), 0
@@ -328,7 +328,7 @@ def garbage_entries():
 class TestBadInput(RedisCase):
     def test_bytes_that_are_not_utf8_do_not_crash_consumers(self):
         redis.Redis.from_url(URL).xadd(self.feed, {b"data": b"\xff\xfe\xfa"})
-        self.board.publish(self.feed, message(1))
+        self.board.publish(message(1), feed=self.feed)
         got = self.consume(1, ack=True)
         self.assertEqual(segments(got), [1])
         self.assertEqual(self.pending(), 0)
@@ -338,12 +338,12 @@ class TestBadInput(RedisCase):
         expected, garbage = [], 0
         for _ in range(300):
             if rng.random() < 0.35:
-                self.board.publish(self.feed, message(len(expected)))
+                self.board.publish(message(len(expected)), feed=self.feed)
                 expected.append(len(expected))
             else:
                 raw.xadd(self.feed, rng.choice(makers)(rng))
                 garbage += 1
-        self.board.publish(self.feed, message(len(expected)))   # a last valid message, so all garbage is read
+        self.board.publish(message(len(expected)), feed=self.feed)   # a last valid message, so all garbage is read
         expected.append(len(expected))
         got = self.consume(len(expected), ack=True, seconds=30)
         self.assertEqual(segments(got), expected)
@@ -352,11 +352,11 @@ class TestBadInput(RedisCase):
 
     def test_messages_trimmed_away_while_pending_do_not_break_recovery(self):
         for i in range(20):
-            self.board.publish(self.feed, message(i))
+            self.board.publish(message(i), feed=self.feed)
         self.consume(20)                                   # handed out, never acked
         self.board.client.xtrim(self.feed, maxlen=0, approximate=False)
         for i in range(20, 23):
-            self.board.publish(self.feed, message(i))
+            self.board.publish(message(i), feed=self.feed)
         got = self.consume(3, ack=True)                   # the same consumer, restarted
         self.assertEqual(segments(got), [20, 21, 22])
         self.assertEqual(self.board.skipped_invalid, 20)
@@ -374,7 +374,7 @@ class TestBadInput(RedisCase):
             '{"kind": "final_text"} looks like JSON',
         ]
         for i, text in enumerate(texts):
-            self.board.publish(self.feed, message(i, text=text))
+            self.board.publish(message(i, text=text), feed=self.feed)
         got = self.consume(len(texts), ack=True)
         self.assertEqual([d.message.text for d in got], texts)
 
@@ -382,8 +382,8 @@ class TestBadInput(RedisCase):
         # group "g" + kind "a:b" and group "g:a" + kind "b" once mapped to the same repeat-skipping key
         one = FeedMessage.new(kind="a:b", session="c", segment=1, start=0, end=1, lang="en", text="one", source="t")
         two = FeedMessage.new(kind="b", session="c", segment=1, start=0, end=1, lang="en", text="two", source="t")
-        self.board.publish(self.feed, one)
-        self.board.publish(self.feed, two)
+        self.board.publish(one, feed=self.feed)
+        self.board.publish(two, feed=self.feed)
         self.assertEqual(len(self.consume(2, group="g:a", ack=True)), 2)
         self.assertEqual([d.message.text for d in self.consume(2, group="g", ack=True)], ["one", "two"])
 
@@ -391,17 +391,17 @@ class TestBadInput(RedisCase):
         # two feeds may each be read by a group with the same name; handling one must not skip the other
         other = f"{self.feed}-other"
         self.addCleanup(self.board.client.delete, other)
-        self.board.publish(self.feed, message(1))
-        self.board.publish(other, message(1))
+        self.board.publish(message(1), feed=self.feed)
+        self.board.publish(message(1), feed=other)
         self.assertEqual(segments(self.consume(1, ack=True)), [1])
         self.assertEqual(segments(run_consumer(self.board, other, "g", "c1", 1, ack=True, start="0")), [1])
 
     def test_acking_twice_or_after_a_trim_is_harmless(self):
-        self.board.publish(self.feed, message(1))
+        self.board.publish(message(1), feed=self.feed)
         [d] = self.consume(1)
         d.ack()
         d.ack()
-        self.board.publish(self.feed, message(2))
+        self.board.publish(message(2), feed=self.feed)
         [e] = self.consume(1)
         self.board.client.xtrim(self.feed, maxlen=0, approximate=False)
         e.ack()
@@ -409,10 +409,10 @@ class TestBadInput(RedisCase):
 
     def test_repeat_protection_ends_after_its_time_limit(self):
         board = Feed.from_url(URL, dedupe_ttl_s=1)
-        board.publish(self.feed, message(5))
+        board.publish(message(5), feed=self.feed)
         run_consumer(board, self.feed, "g", "c1", 1, ack=True, start="0")
         time.sleep(1.3)
-        board.publish(self.feed, message(5))              # the same message, long after
+        board.publish(message(5), feed=self.feed)              # the same message, long after
         self.assertEqual(segments(run_consumer(board, self.feed, "g", "c1", 1, ack=True, start="0")), [5])
 
 
@@ -474,7 +474,7 @@ class TestLoad(RedisCase):
         # live speech produces about one finished sentence every few seconds per session
         started = time.monotonic()
         for i in range(2000):
-            self.board.publish(self.feed, message(i))
+            self.board.publish(message(i), feed=self.feed)
         published = time.monotonic() - started
         started = time.monotonic()
         got = self.consume(2000, ack=True, seconds=60, batch=100)

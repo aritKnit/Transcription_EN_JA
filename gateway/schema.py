@@ -22,6 +22,19 @@ TRANSLATIONS = "translations"
 KIND_FINAL_TEXT = "final_text"
 KIND_TRANSLATION = "translation"
 
+# The feed each kind of message is published to.
+FEED_FOR_KIND = {
+    KIND_FINAL_TEXT: FINAL_TEXT,
+    KIND_TRANSLATION: TRANSLATIONS,
+}
+
+# The consumer groups, and the feed each one reads. Every group sees every message of its feed.
+# A new service adds its group here (see "Adding a new service" in the design).
+GROUPS = {
+    "translator": FINAL_TEXT,      # translation worker (Phase 9): reads finished text
+    "gateway": TRANSLATIONS,       # session gateway (Phase 4): forwards translations to the browser
+}
+
 VERSION = 1
 
 

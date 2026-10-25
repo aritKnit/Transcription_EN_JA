@@ -2,6 +2,19 @@
 
 Changelog of what has been built, newest first. The sequence and status of each phase is in [plan.md](plan.md).
 
+## Phase 3 requirements met to the letter, and the plan's check run (2026-10-25)
+
+Checked each Phase 3 item literally and closed two gaps:
+
+- **The two streams did not exist.** `final-text` and `translations` were only names in the code; nothing created them or declared their groups, and every test ran on throwaway feed names.
+  Now [schema.py](gateway/schema.py) declares, in one place, which feed each kind of message goes to (`FEED_FOR_KIND`) and which consumer groups read which feed (`GROUPS`: `translator` reads `final-text`, `gateway` reads `translations`).
+  `Feed.ensure_feeds()`, or `python -m gateway.feed init`, creates both streams with their groups; it is safe to run again. Done on the real Redis: both are streams, each with its group.
+- **The API was not the plan's.** It is now `publish(message)`, which picks the feed from the message's kind, and `consume(group, name)`, which reads the feed declared for the group. Both take `feed=` for anything undeclared. All callers and tests were moved over.
+- **"Without repeats" made strict.** `delivery.ack(also=...)` puts the handler's own Redis writes in the same transaction as the ack, and `Feed.add_publish(pipe, message)` queues a publish for it, so a worker's result (a translation) and its ack happen together or not at all. A crash can then neither lose a message nor repeat its result. Results written outside Redis can still repeat once per crash.
+- **The check**, as [gateway/check_restart.py](gateway/check_restart.py) (`python -m gateway.check_restart`): on the real `final-text` feed and `translator` group, it publishes test messages under its own session id, kills the consuming process with SIGKILL several times mid-stream, restarts it under the same name, and requires every message handled exactly once with nothing left pending.
+  Results: 100 messages with 3 kills, and three runs of 300 messages with 6 kills and only 5 ms of work per message (so kills land anywhere, including during the ack): **every run handled every message once, 0 repeats, 0 missing, 0 pending**. Afterwards the feed was empty, no keys were left, and the check's consumer was removed from the group.
+- Tests: 70 (new: the two feeds and their groups, publishing by kind, consuming by group, posting a result with the ack, a failed extra write leaving the message unacked, and a kill test with four kills that requires zero repeats). Two full runs passed.
+
 ## Phase 3 robustness tests (2026-10-25)
 
 Goal: try to break the message board, and fix what breaks.

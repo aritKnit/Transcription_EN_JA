@@ -201,11 +201,19 @@ Services in this design never call each other. They post messages to a **feed** 
 docker compose up -d redis                          # Redis 7 with its data saved to disk (append-only file) in the volume redis-data
 docker compose exec redis redis-cli ping            # PONG
 pip install -r gateway/requirements.txt             # redis and pydantic, for the library below
+python -m gateway.feed init                         # create the feeds and their consumer groups (safe to run again)
 ```
 
 **The message.** Every part uses the same shape ([gateway/schema.py](gateway/schema.py)); `version` lets it grow without breaking old readers (unknown fields are ignored),
 `kind` says what it is, `session` and `segment` let any service skip repeats, and `made_at` is each stage's own timestamp.
-Two feeds exist so far: `final-text` (kind `final_text`) and `translations` (kind `translation`).
+Two feeds exist so far, each with a consumer group, both declared in one place in [schema.py](gateway/schema.py):
+
+| Feed | Carries kind | Consumer group (reads it) |
+|---|---|---|
+| `final-text` | `final_text` | `translator` (translation worker, Phase 9) |
+| `translations` | `translation` | `gateway` (forwards translations to the browser, Phase 4) |
+
+A new service adds its group to `GROUPS` (and a new kind of message to `FEED_FOR_KIND`), then runs `init`.
 
 ```json
 {"version": 1, "kind": "final_text", "session": "s-7f3a", "segment": 42, "start": 81.2, "end": 84.95,
@@ -216,27 +224,36 @@ Two feeds exist so far: `final-text` (kind `final_text`) and `translations` (kin
 
 ```python
 from gateway.feed import Feed, FeedUnavailable
-from gateway.schema import FINAL_TEXT, KIND_FINAL_TEXT, FeedMessage
+from gateway.schema import KIND_FINAL_TEXT, FeedMessage
 
 board = Feed.from_url("redis://localhost:6379/0")        # or $REDIS_URL; in Compose: redis://redis:6379/0
+board.ensure_feeds()                                     # same as `python -m gateway.feed init`
 
 message = FeedMessage.new(kind=KIND_FINAL_TEXT, session="s-7f3a", segment=42, start=81.2, end=84.95,
                           lang="en", text="hello", source="speech-engine@sensevoice")
 try:
-    board.publish(FINAL_TEXT, message)
+    board.publish(message)                               # goes to final-text, because of its kind
 except FeedUnavailable:
     ...                                                  # Redis is down: carry on without it
 
-for delivery in board.consume(FINAL_TEXT, group="translators", consumer="translator-1"):
+for delivery in board.consume("translator", "translator-1"):   # group, consumer name; the feed comes from GROUPS
     handle(delivery.message)
     delivery.ack()                                       # until it is acked, a message is handed out again after a restart
+```
+
+`publish(message, feed=...)` and `consume(group, name, feed=...)` take a feed explicitly for kinds and groups that are not declared.
+When the result of handling a message is itself a Redis write (a worker posting a translation), put it in the same transaction as the ack, so the two happen together or not at all:
+
+```python
+delivery.ack(also=lambda pipe: board.add_publish(pipe, translation))   # translation lands on `translations`
 ```
 
 What the library guarantees:
 
 - **Every group sees every message; within a group each message goes to one consumer.** Use a different `group` for each kind of service.
 - **A service that restarts carries on where it stopped.** Messages it was given but never acked come back first; acked ones do not. If a consumer dies, another one in the group takes over its unacked messages after 30 s.
-- **No repeats.** After you `ack()`, the message (its feed, group, kind, session and segment) is remembered for an hour, and the same message arriving again is skipped. Delivery is at least once, so a crash between handling and `ack()` can hand out that one message again; make handlers safe to run twice.
+- **No repeats.** After you `ack()`, the message (its feed, group, kind, session and segment) is remembered for an hour, and the same message arriving again is skipped.
+  If the result is written with `ack(also=...)`, a crash can neither lose a message nor repeat its result. A result written anywhere else (a file, another service) can repeat once if the crash falls between that write and `ack()`, so make such handlers safe to run twice.
 - **Bad messages never block a feed.** Anything that is not a valid message, including bytes that are not UTF-8, is acked and skipped. Times must be finite numbers.
 - **Redis trouble is survivable.** If Redis is gone, hung, still loading its data after a restart, or full, `consume` waits and carries on (and rebuilds its group if Redis comes back empty); it stops at once when asked to, even mid-outage.
   `publish` and `ack()` raise `FeedUnavailable` instead (within about one socket timeout), so the gateway can keep sending text straight to the browser; an unacked message is simply handed out again later.
@@ -247,12 +264,22 @@ What the library guarantees:
 Try it by hand, in two terminals:
 
 ```bash
-python -m gateway.feed tail --group demo --consumer me        # prints messages as they arrive
+python -m gateway.feed tail --group translator --consumer me  # prints what arrives on final-text
 python -m gateway.feed publish --text "hello" --segment 1     # from another terminal
 ```
 
-Checks: `python -m pytest gateway` (60 tests, about a minute; the ones that need Redis use database 15 and are skipped if Redis is not running).
-[test_feed.py](gateway/tests/test_feed.py) covers the behaviour above, including killing a consumer with `kill -9` mid-feed and restarting it.
+**The plan's check**, on the real `final-text` feed and its `translator` group:
+
+```bash
+python -m gateway.check_restart                                  # 100 messages, the consumer killed 3 times
+python -m gateway.check_restart --messages 300 --kills 6 --delay 0.005
+```
+
+It publishes test messages under a session id of its own, kills the consuming process with SIGKILL several times while it works, restarts it under the same name, and passes only if every
+message was handled exactly once and nothing is left pending. It removes its messages and traces afterwards ([check_restart.py](gateway/check_restart.py)).
+
+Tests: `python -m pytest gateway` (70 tests, under a minute; the ones that need Redis use database 15 and are skipped if Redis is not running).
+[test_feed.py](gateway/tests/test_feed.py) covers the behaviour above: the two feeds and their groups, publishing by kind, consuming by group, and killing a consumer with `kill -9` mid-feed (four times in one test, with zero repeats).
 [test_robustness.py](gateway/tests/test_robustness.py) tries to break it: a TCP proxy ([faulty_proxy.py](gateway/tests/faulty_proxy.py)) between the library and Redis drops connections, refuses them or hangs;
 8 publishers and 3 consumers run at once; three worker processes are killed at random eight times; random garbage, bytes that are not UTF-8, trimmed messages and 1 MB texts go through the feed;
 the message shape is fuzzed with 3,000 tricky inputs; and throughput is measured (about 1,000 publishes and 500 consume-and-acks per second on this machine).

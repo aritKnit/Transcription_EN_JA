@@ -4,10 +4,11 @@ A feed is a Redis stream. Many services can read the same feed, each as its own 
 sees every message. Inside a group, each message goes to one consumer, and the group remembers what was
 handled, so a service that restarts carries on instead of starting over.
 
-    feed = Feed.from_url("redis://localhost:6379/0")
-    feed.publish(FINAL_TEXT, message)
+    board = Feed.from_url("redis://localhost:6379/0")
+    board.ensure_feeds()                       # final-text and translations, with their consumer groups
+    board.publish(message)                     # to the feed for message.kind (final_text -> final-text)
 
-    for delivery in feed.consume(FINAL_TEXT, group="translators", consumer="translator-1"):
+    for delivery in board.consume("translator", "translator-1"):   # the group's feed, from schema.GROUPS
         handle(delivery.message)
         delivery.ack()        # until it is acked, a message is handed out again after a restart
 
@@ -15,10 +16,16 @@ Delivery is at least once: a crash between handling and ``ack()`` hands that one
 that causing repeats, ``ack()`` also remembers the message (feed, group, ``kind``, ``session``, ``segment``) for ``dedupe_ttl_s`` seconds,
 and a later delivery of the same message is acked and skipped without reaching the caller.
 
+A handler whose result is itself a Redis write (posting a translation, for example) can put that write
+in the same transaction as the ack: ``delivery.ack(also=lambda pipe: board.add_publish(pipe, translation))``.
+Then the result and the ack happen together or not at all, and a crash can neither lose the message nor
+repeat its result.
+
 Run it by hand:
 
+    python -m gateway.feed init
     python -m gateway.feed publish --text "hello"
-    python -m gateway.feed tail --group demo --consumer me
+    python -m gateway.feed tail --group translator --consumer me
 """
 from __future__ import annotations
 
@@ -35,7 +42,7 @@ from typing import Iterator, Optional
 import redis
 from pydantic import ValidationError
 
-from gateway.schema import FINAL_TEXT, KIND_FINAL_TEXT, FeedMessage
+from gateway.schema import FEED_FOR_KIND, GROUPS, KIND_FINAL_TEXT, FeedMessage
 
 log = logging.getLogger("feed")
 
@@ -63,10 +70,14 @@ class Delivery:
     message: FeedMessage
     _board: "Feed"
 
-    def ack(self):
+    def ack(self, also=None):
         """Mark the message handled. Raises ``FeedUnavailable`` if Redis cannot be used; the message is then
-        handed out again later, so the caller can simply carry on."""
-        self._board._ack(self.feed, self.group, self.id, self.message)
+        handed out again later, so the caller can simply carry on.
+
+        ``also(pipe)`` may add Redis writes (a result) to the same transaction, so they and the ack happen
+        together or not at all.
+        """
+        self._board._ack(self.feed, self.group, self.id, self.message, also)
 
 
 class Feed:
@@ -97,20 +108,46 @@ class Feed:
         )
         return cls(client, **kwargs)
 
-    def publish(self, feed: str, message: FeedMessage) -> str:
-        """Add a message to a feed and return its id.
+    @staticmethod
+    def feed_for(message: FeedMessage) -> str:
+        """The feed a message is published to, from its kind."""
+        try:
+            return FEED_FOR_KIND[message.kind]
+        except KeyError:
+            raise ValueError(f"no feed for kind '{message.kind}'; add it to FEED_FOR_KIND or pass feed=") from None
+
+    def ensure_feeds(self) -> dict:
+        """Create every feed and consumer group declared in ``schema.GROUPS`` (safe to run again).
+
+        A group created here starts at the end of its feed, so create groups before anything is published.
+        Returns ``{feed: [groups]}``.
+        """
+        created = {}
+        for group, feed in GROUPS.items():
+            self.create_group(feed, group, "$")
+            created.setdefault(feed, []).append(group)
+        return created
+
+    def publish(self, message: FeedMessage, feed: Optional[str] = None) -> str:
+        """Add a message to its feed (from ``message.kind``, or ``feed`` if given) and return its id.
 
         Raises ``FeedUnavailable`` if Redis cannot be reached or cannot accept writes right now. A publish that
         timed out may still have reached Redis; consumers skip such a repeat.
         """
         try:
-            return self.client.xadd(feed, {"data": message.to_json()}, maxlen=self.maxlen, approximate=True)
+            return self.client.xadd(feed or self.feed_for(message), {"data": message.to_json()},
+                                    maxlen=self.maxlen, approximate=True)
         except (redis.ConnectionError, redis.TimeoutError) as e:
             raise FeedUnavailable(str(e)) from e
         except redis.ResponseError as e:
             if _transient(e):
                 raise FeedUnavailable(str(e)) from e
             raise
+
+    def add_publish(self, pipe, message: FeedMessage, feed: Optional[str] = None):
+        """Queue a publish on a pipeline, for ``delivery.ack(also=...)``: the result is posted together with
+        the ack, or neither happens."""
+        pipe.xadd(feed or self.feed_for(message), {"data": message.to_json()}, maxlen=self.maxlen, approximate=True)
 
     def create_group(self, feed: str, group: str, start: str = "$"):
         """Make sure a group exists (and the feed). ``start="$"`` means only messages published from now on;
@@ -121,10 +158,12 @@ class Feed:
             if "BUSYGROUP" not in str(e):
                 raise
 
-    def consume(self, feed: str, group: str, consumer: str, *, batch: int = 10, block_ms: int = 1000,
+    def consume(self, group: str, name: str, *, feed: Optional[str] = None, batch: int = 10, block_ms: int = 1000,
                 claim_idle_ms: int = 30_000, claim_every_s: float = 5.0, start: str = "$",
                 stop: Optional[threading.Event] = None) -> Iterator[Delivery]:
-        """Yield the messages of a feed for this consumer, forever (until ``stop`` is set).
+        """Yield the messages of a group's feed for the consumer ``name``, forever (until ``stop`` is set).
+
+        The feed is the one ``schema.GROUPS`` declares for ``group``; pass ``feed`` for any other.
 
         Order: first the messages this consumer was handed before but never acked (so a restarted service
         picks up where it was), then messages another consumer was handed more than ``claim_idle_ms`` ago and
@@ -132,6 +171,11 @@ class Feed:
         feed messages are acked and skipped. If Redis goes away, is loading or is full, this waits (waking up
         at once if ``stop`` is set) and carries on.
         """
+        if feed is None:
+            if group not in GROUPS:
+                raise ValueError(f"group '{group}' is not in schema.GROUPS; add it there or pass feed=")
+            feed = GROUPS[group]
+        consumer = name
         timeout = self.client.connection_pool.connection_kwargs.get("socket_timeout")
         if timeout and block_ms / 1000 >= timeout:
             raise ValueError(f"block_ms ({block_ms}) must be shorter than the client's socket timeout ({timeout} s)")
@@ -217,9 +261,11 @@ class Feed:
         parts = [feed, group, message.kind, message.session, message.segment]
         return "done:" + json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
 
-    def _ack(self, feed, group, entry_id, message):
+    def _ack(self, feed, group, entry_id, message, also=None):
         try:
             pipe = self.client.pipeline(transaction=True)
+            if also is not None:
+                also(pipe)
             pipe.xack(feed, group, entry_id)
             if self.dedupe_ttl_s:
                 pipe.set(self._done_key(feed, group, message), 1, ex=self.dedupe_ttl_s)
@@ -236,30 +282,37 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--url", default=None, help=f"Redis URL (default: $REDIS_URL or {DEFAULT_URL})")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("init", help="create the feeds and consumer groups declared in schema.GROUPS")
     pub = sub.add_parser("publish", help="post one sample message")
-    pub.add_argument("--feed", default=FINAL_TEXT)
+    pub.add_argument("--kind", default=KIND_FINAL_TEXT, help="decides the feed (final_text -> final-text)")
+    pub.add_argument("--feed", default=None, help="publish to this feed instead")
     pub.add_argument("--session", default="s-demo")
     pub.add_argument("--segment", type=int, default=0)
     pub.add_argument("--lang", default="en")
     pub.add_argument("--text", default="hello")
-    tail = sub.add_parser("tail", help="print messages as they arrive, as a consumer group")
-    tail.add_argument("--feed", default=FINAL_TEXT)
-    tail.add_argument("--group", default="demo")
+    tail = sub.add_parser("tail", help="print messages as they arrive, as a consumer in a group")
+    tail.add_argument("--group", default="translator")
     tail.add_argument("--consumer", default="me")
+    tail.add_argument("--feed", default=None, help="for a group not in schema.GROUPS")
     args = parser.parse_args()
 
     board = Feed.from_url(args.url)
     try:
-        if args.command == "publish":
-            message = FeedMessage.new(kind=KIND_FINAL_TEXT, session=args.session, segment=args.segment, start=0.0,
+        if args.command == "init":
+            for feed, groups in board.ensure_feeds().items():
+                print(f"{feed}: groups {', '.join(groups)}")
+        elif args.command == "publish":
+            message = FeedMessage.new(kind=args.kind, session=args.session, segment=args.segment, start=0.0,
                                       end=1.0, lang=args.lang, text=args.text, source="cli")
-            print(board.publish(args.feed, message))
+            print(board.publish(message, feed=args.feed))
         else:
-            for delivery in board.consume(args.feed, args.group, args.consumer):
+            for delivery in board.consume(args.group, args.consumer, feed=args.feed):
                 m = delivery.message
                 print(f"{delivery.id}  {m.session}#{m.segment} [{m.kind}/{m.lang}] {m.text}", flush=True)
                 delivery.ack()
     except FeedUnavailable as e:
+        raise SystemExit(f"Cannot reach Redis: {e}")
+    except redis.ConnectionError as e:
         raise SystemExit(f"Cannot reach Redis: {e}")
     except KeyboardInterrupt:
         pass

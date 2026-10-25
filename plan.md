@@ -68,11 +68,11 @@ See the pipeline run on live audio before building more around it.
 
 ## Phase 3: Redis and the message board `[x]`
 - [x] `redis:7` in Compose, append-only file, volume (`redis-data`), memory caps, health check.
-- [x] Streams `final-text` and `translations`, with consumer groups.
-- [x] `gateway/schema.py` (message model) and a small feed library, `gateway/feed.py`: `publish(feed, message)` and `consume(feed, group, consumer)`, with restart recovery, takeover, repeat skipping and reconnect.
+- [x] Streams `final-text` and `translations`, with consumer groups: declared in `gateway/schema.py` (`FEED_FOR_KIND`, `GROUPS`: `translator` reads `final-text`, `gateway` reads `translations`) and created by `python -m gateway.feed init` (`Feed.ensure_feeds()`).
+- [x] `gateway/schema.py` (message model, `FeedMessage`) and a small feed library, `gateway/feed.py`: `publish(msg)` (feed chosen by the message's kind) and `consume(group, name)` (feed chosen by the group), with restart recovery, takeover, repeat skipping, reconnect, and `ack(also=...)` to post a result together with the ack.
 
-Check (passed): a consumer killed with `kill -9` mid-feed and restarted handles every message and does not redo what it had finished; Redis restarted with its data and a running consumer reconnected.
-Robustness suite (failure injection, concurrency, random kills, garbage, fuzzing, load) found and fixed eight bugs; 60 tests in `gateway/tests`, four clean runs in a row.
+Check (passed): kill a consumer mid-stream, restart it, and it continues without repeats. `python -m gateway.check_restart` on the real `final-text` feed and `translator` group: 100 messages with 3 SIGKILLs, and three runs of 300 messages with 6 SIGKILLs, each handled every message exactly once (0 repeats, 0 missing, 0 pending).
+Also: Redis restarted with its data and a running consumer reconnected; the robustness suite (failure injection, concurrency, random kills, garbage, fuzzing, load) found and fixed eight bugs. 70 tests in `gateway/tests`.
 
 ## Phase 4: Session gateway `[ ]`
 FastAPI with `/ws`, `/api`, `/health`, `/ready`. In order:
