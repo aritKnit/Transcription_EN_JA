@@ -61,17 +61,18 @@ Normally the engine's chunk restarts after each finished sentence, which hides t
 2. [ ] Re-run the client-VAD experiment on the branch after that. Merge it only if it then at least matches the no-gate run.
 3. The web app (Phase 5) would need its own browser copy of the gate; the experiment's sent-time map and 600 ms tail rule would carry over.
 
-## Phase 2e: Live audio check `[~]`
+## Phase 2e: Live audio check `[x]`
 See the pipeline run on live audio before building more around it.
 1. [x] Instructions to start the live pipeline and run a one-minute check: [README.md](README.md), "Live microphone". Capture path checked with a virtual microphone in English (no extra delay beyond the file replays).
-2. [ ] One minute of real speech in English and one in Japanese through the microphone (the person running it), saving the recordings with `--save_output_recording`; then replay them through the bench and note what goes wrong.
+2. [x] One minute of real speech in English and one in Japanese through the microphone (the person running it). The green light for Phase 3 was given on 2026-10-25; the observations themselves are not recorded here.
 
-## Phase 3: Redis and the message board `[ ]`
-- `redis:7` in Compose, append-only file, volume.
-- Streams `final-text` and `translations`, with consumer groups.
-- `gateway/schema.py` (message model) and a small feed library: `publish(msg)`, `consume(group, name)`.
+## Phase 3: Redis and the message board `[x]`
+- [x] `redis:7` in Compose, append-only file, volume (`redis-data`), memory caps, health check.
+- [x] Streams `final-text` and `translations`, with consumer groups.
+- [x] `gateway/schema.py` (message model) and a small feed library, `gateway/feed.py`: `publish(feed, message)` and `consume(feed, group, consumer)`, with restart recovery, takeover, repeat skipping and reconnect.
 
-Check: kill a consumer mid-stream, restart it, and it continues without repeats.
+Check (passed): a consumer killed with `kill -9` mid-feed and restarted handles every message and does not redo what it had finished; Redis restarted with its data and a running consumer reconnected.
+Robustness suite (failure injection, concurrency, random kills, garbage, fuzzing, load) found and fixed eight bugs; 60 tests in `gateway/tests`, four clean runs in a row.
 
 ## Phase 4: Session gateway `[ ]`
 FastAPI with `/ws`, `/api`, `/health`, `/ready`. In order:

@@ -31,3 +31,33 @@ services:
     cpus: ${ENGINE_CPUS:-4}
     mem_limit: ${ENGINE_MEM:-3g}
     restart: unless-stopped
+
+  redis:
+    image: redis:7
+    # Streams must never be evicted, so memory is bounded by trimming each stream (MAXLEN), not by eviction.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-200mb}
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
+    ports:
+      # for testing from the host; services reach it over the compose network as redis:6379
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    cpus: ${REDIS_CPUS:-0.5}
+    mem_limit: ${REDIS_MEM:-256m}
+    restart: unless-stopped
+
+volumes:
+  redis-data:

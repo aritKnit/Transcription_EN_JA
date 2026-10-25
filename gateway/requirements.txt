@@ -1,0 +1,3 @@
+# Message board library (schema and feed); the gateway's own dependencies are added in Phase 4.
+redis>=6,<9
+pydantic>=2.5,<3

@@ -2,6 +2,42 @@
 
 Changelog of what has been built, newest first. The sequence and status of each phase is in [plan.md](plan.md).
 
+## Phase 3 robustness tests (2026-10-25)
+
+Goal: try to break the message board, and fix what breaks.
+
+- [gateway/tests/test_robustness.py](gateway/tests/test_robustness.py), 28 tests (the gateway suite is now 60, about a minute):
+  - Redis failures through [faulty_proxy.py](gateway/tests/faulty_proxy.py), a TCP proxy that drops connections, refuses new ones or goes silent: publishing while Redis is down or hung, a consumer surviving ten connection drops in 200 messages, a consumer waiting out a hang, shutting down mid-outage, acking mid-outage, and Redis answering `LOADING`, `OOM`, `MISCONF` or `READONLY`.
+  - Concurrency: 8 publishers and 3 consumers at once (2,000 messages, each handled exactly once), per-publisher order with one consumer, 20 groups.
+  - Chaos: three worker processes, eight random `kill -9`s and restarts over 300 messages: every message handled, no more repeats than kills.
+  - Bad input: bytes that are not UTF-8, 300 entries of random garbage mixed with messages, messages trimmed away while pending, 1 MB and unusual texts, names containing separators, the same message in two feeds, double acks, the repeat-protection time limit.
+  - The message shape fuzzed with 3,000 combinations of tricky values and 2,000 random byte strings.
+  - Load: about 1,065 publishes and 500 consume-and-acks per second; an idle consumer logs nothing.
+- **Bugs they found, now fixed** in [feed.py](gateway/feed.py) and [schema.py](gateway/schema.py):
+  1. One entry whose bytes were not UTF-8 made every read of the feed fail, so all consumers crashed and crashed again on restart. Bytes are now decoded leniently and such an entry is skipped.
+  2. A time of infinity was accepted and written to JSON as `null`, which every reader then rejects, so the message was lost. Times must now be finite.
+  3. Repeat-skipping keys could collide when names contained `:` (group `g` with kind `a:b` and group `g:a` with kind `b`), so one group's work made another skip a message. The key is now a JSON list.
+  4. The same key ignored the feed, so the same message in two feeds read by groups of the same name was skipped in the second. The key now includes the feed.
+  5. `ack()` during a connection drop raised a raw Redis error that ended the caller's loop; in the test only 147 of 200 messages got handled. It now raises `FeedUnavailable`, and the message is handed out again.
+  6. `consume()` crashed when Redis answered `LOADING` (right after a restart) or `OOM` (full; reading with a group counts as a write), exactly when it should wait. Those and `MISCONF`, `READONLY`, `BUSY` and `MASTERDOWN` are now treated as an outage; `publish` and `ack()` raise `FeedUnavailable` for them.
+  7. Shutting a consumer down during an outage could take up to 5 s (it slept through its retry wait). It now wakes up at once.
+  8. Rebuilding a lost group happened inside the error handler, where a second error would escape; it now happens in the main loop. A `Feed` built on a client that returns bytes (which would have treated every message as invalid) is refused up front.
+- Four full runs of the suite in a row passed. Not covered: real disk-full or Redis process crashes (simulated with mocked replies and the proxy), and more than one machine.
+
+## Phase 3: Redis message board (2026-10-25)
+
+Goal: services share results through feeds instead of calling each other, and a service that restarts carries on.
+
+- [docker-compose.yml](docker-compose.yml): new `redis` service (Redis 7). Append-only file on a named volume (`redis-data`), `maxmemory` 200 MB with `noeviction` (feeds are bounded by trimming, never by eviction), CPU and memory caps, health check, `restart: unless-stopped`, port 6379 on `127.0.0.1` for host-side testing. Settings `REDIS_MAXMEMORY`, `REDIS_CPUS` and `REDIS_MEM` in [.env.example](.env.example).
+- [gateway/schema.py](gateway/schema.py): `FeedMessage`, the one message shape from the design (version, kind, session, segment, start, end, lang, text, made_at, source). Unknown fields from a newer writer are ignored, times need a zone, `made_at` is written as UTC with milliseconds and `Z`, and `end` cannot precede `start`. Feed names `final-text` and `translations`.
+- [gateway/feed.py](gateway/feed.py): `Feed.publish` and `Feed.consume`, plus a small command line (`python -m gateway.feed publish|tail`). Consumer groups, so every group sees every message and each message goes to one consumer in a group. On start a consumer first gets back what it was handed but never acked, then adopts another consumer's unacked messages after 30 s, then new ones. `ack()` also records (kind, session, segment) for an hour so a redelivered message is skipped. Invalid messages are acked and skipped. `consume` waits out a lost connection and rebuilds its group if Redis comes back empty; `publish` raises `FeedUnavailable` so the gateway can fall back to sending text straight to the browser. Feeds are trimmed to about 10 000 messages.
+- [gateway/requirements.txt](gateway/requirements.txt): `redis` and `pydantic`.
+- Tests: [test_schema.py](gateway/tests/test_schema.py) and [test_feed.py](gateway/tests/test_feed.py), 32 passing, three more full runs without a flaky result. The feed tests use a real Redis (database 15) and are skipped without one. They cover groups, work sharing between consumers, redelivery after a restart, takeover of a dead consumer's message, repeat skipping, garbage in the feed, publishing with Redis down, a lost connection, Redis coming back empty, the stop signal and trimming.
+- **Plan check, passed:** a consumer process killed with `kill -9` mid-feed and restarted handled every one of the 60 messages, with nothing it had finished handled again (at most the single message in flight at the moment of the kill can repeat; the test allows exactly that).
+- **Also checked by hand:** after `docker compose restart redis` the stream still held its messages and the group still knew where it had stopped, and a consumer that was running during the restart logged two retries, reconnected, and received the message published afterwards.
+- Found while testing: a message stamped with microseconds came back with milliseconds after a round trip, so `FeedMessage.new` now stamps in milliseconds; and when a feed is deleted while a consumer is blocked on it, Redis answers `UNBLOCKED` rather than `NOGROUP`, so both now mean "rebuild the group".
+- Not done: nothing publishes to the feeds yet (that is the gateway, Phase 4), and there is no password on Redis (it listens on `127.0.0.1` only).
+
 ## Live audio check and how to run it (2026-10-25)
 
 Goal: see the pipeline run on live audio before starting Phase 3.

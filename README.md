@@ -18,10 +18,11 @@ The target design is in `Real-Time Transcription HLD.pdf`, and the build order i
 | Speech engine (Docker): swappable model (SenseVoice-Small or faster-whisper), preload, `/ready`, backlog meter, seat limit | Built |
 | Live microphone through the engine (the WhisperLive client, see "Live microphone") | Works |
 | Test bench: real-time replay, WER / CER, delays | Built ([bench/](bench/)) |
-| Redis message board, session gateway, web app, Caddy, monitoring, translation | Not built yet (plan.md phases 3 to 9) |
+| Message board: Redis (Docker) and a small library to publish to and read from feeds, safe across restarts | Built ([gateway/](gateway/)); nothing publishes to it yet |
+| Session gateway, web app, Caddy, monitoring, translation | Not built yet (plan.md phases 4 to 9) |
 
 So for now you talk to the engine directly with a WebSocket client (the WhisperLive client, the bench, or your own code).
-There is no browser page yet.
+There is no browser page yet, and the engine's text does not yet flow through the message board (that is the gateway's job, Phase 4).
 
 ## Requirements
 
@@ -191,6 +192,74 @@ implements `transcribe_audio` (audio in, segments with `start`, `end`, `text` ou
 [sensevoice_backend.py](WhisperLive/whisper_live/backend/sensevoice_backend.py) is the shortest example. Then register it: add a value to `BackendType` and a branch in `initialize_client`
 and in the `--preload` step of [server.py](WhisperLive/whisper_live/server.py), and add its dependencies to [engine/requirements.txt](engine/requirements.txt).
 
+## Message board (Redis)
+
+Services in this design never call each other. They post messages to a **feed** and read them from one, and a feed is a Redis stream. That lets a new service
+(translation, export, a glossary check) join by reading a feed, without changing the engine or the gateway. Nothing publishes to the feeds yet; the gateway will in Phase 4.
+
+```bash
+docker compose up -d redis                          # Redis 7 with its data saved to disk (append-only file) in the volume redis-data
+docker compose exec redis redis-cli ping            # PONG
+pip install -r gateway/requirements.txt             # redis and pydantic, for the library below
+```
+
+**The message.** Every part uses the same shape ([gateway/schema.py](gateway/schema.py)); `version` lets it grow without breaking old readers (unknown fields are ignored),
+`kind` says what it is, `session` and `segment` let any service skip repeats, and `made_at` is each stage's own timestamp.
+Two feeds exist so far: `final-text` (kind `final_text`) and `translations` (kind `translation`).
+
+```json
+{"version": 1, "kind": "final_text", "session": "s-7f3a", "segment": 42, "start": 81.2, "end": 84.95,
+ "lang": "en", "text": "...", "made_at": "2026-10-01T10:15:03.120Z", "source": "speech-engine@sensevoice"}
+```
+
+**Publishing and reading** ([gateway/feed.py](gateway/feed.py)):
+
+```python
+from gateway.feed import Feed, FeedUnavailable
+from gateway.schema import FINAL_TEXT, KIND_FINAL_TEXT, FeedMessage
+
+board = Feed.from_url("redis://localhost:6379/0")        # or $REDIS_URL; in Compose: redis://redis:6379/0
+
+message = FeedMessage.new(kind=KIND_FINAL_TEXT, session="s-7f3a", segment=42, start=81.2, end=84.95,
+                          lang="en", text="hello", source="speech-engine@sensevoice")
+try:
+    board.publish(FINAL_TEXT, message)
+except FeedUnavailable:
+    ...                                                  # Redis is down: carry on without it
+
+for delivery in board.consume(FINAL_TEXT, group="translators", consumer="translator-1"):
+    handle(delivery.message)
+    delivery.ack()                                       # until it is acked, a message is handed out again after a restart
+```
+
+What the library guarantees:
+
+- **Every group sees every message; within a group each message goes to one consumer.** Use a different `group` for each kind of service.
+- **A service that restarts carries on where it stopped.** Messages it was given but never acked come back first; acked ones do not. If a consumer dies, another one in the group takes over its unacked messages after 30 s.
+- **No repeats.** After you `ack()`, the message (its feed, group, kind, session and segment) is remembered for an hour, and the same message arriving again is skipped. Delivery is at least once, so a crash between handling and `ack()` can hand out that one message again; make handlers safe to run twice.
+- **Bad messages never block a feed.** Anything that is not a valid message, including bytes that are not UTF-8, is acked and skipped. Times must be finite numbers.
+- **Redis trouble is survivable.** If Redis is gone, hung, still loading its data after a restart, or full, `consume` waits and carries on (and rebuilds its group if Redis comes back empty); it stops at once when asked to, even mid-outage.
+  `publish` and `ack()` raise `FeedUnavailable` instead (within about one socket timeout), so the gateway can keep sending text straight to the browser; an unacked message is simply handed out again later.
+  A publish that timed out may still have reached Redis, which consumers then skip as a repeat.
+- **Feeds are trimmed** to roughly 10 000 messages, and Redis is capped at 200 MB and 256 MB of container memory (see `.env`), so they cannot grow without limit.
+- A new group starts at the end of a feed by default (`start="$"`): it sees messages from then on, not the history. Pass `start="0"` to read everything the feed still holds.
+
+Try it by hand, in two terminals:
+
+```bash
+python -m gateway.feed tail --group demo --consumer me        # prints messages as they arrive
+python -m gateway.feed publish --text "hello" --segment 1     # from another terminal
+```
+
+Checks: `python -m pytest gateway` (60 tests, about a minute; the ones that need Redis use database 15 and are skipped if Redis is not running).
+[test_feed.py](gateway/tests/test_feed.py) covers the behaviour above, including killing a consumer with `kill -9` mid-feed and restarting it.
+[test_robustness.py](gateway/tests/test_robustness.py) tries to break it: a TCP proxy ([faulty_proxy.py](gateway/tests/faulty_proxy.py)) between the library and Redis drops connections, refuses them or hangs;
+8 publishers and 3 consumers run at once; three worker processes are killed at random eight times; random garbage, bytes that are not UTF-8, trimmed messages and 1 MB texts go through the feed;
+the message shape is fuzzed with 3,000 tricky inputs; and throughput is measured (about 1,000 publishes and 500 consume-and-acks per second on this machine).
+Restarting the Redis container (`docker compose restart redis`) also keeps the feeds and where each group had got to.
+
+This is a single Redis for one machine, bound to `127.0.0.1` without a password. Before exposing it beyond the laptop, add authentication and keep it off public networks.
+
 ## Settings (`.env`)
 
 | Setting | Default | Meaning |
@@ -202,8 +271,10 @@ and in the `--preload` step of [server.py](WhisperLive/whisper_live/server.py), 
 | `ENGINE_THREADS` | `4` | CPU threads used by the model |
 | `ENGINE_CPUS` | `4` | CPU cap for the container |
 | `ENGINE_MEM` | `3g` | Memory cap for the container |
+| `REDIS_MAXMEMORY` | `200mb` | Redis refuses writes above this (feeds are trimmed well before) |
+| `REDIS_CPUS`, `REDIS_MEM` | `0.5`, `256m` | CPU and memory caps for the Redis container |
 
-Ports (bound to `127.0.0.1` only): `9090` WebSocket audio, `8000` `/health` and `/ready`. Prometheus metrics are on port `9091`
+Ports (bound to `127.0.0.1` only): `9090` WebSocket audio, `8000` `/health` and `/ready`, `6379` Redis. Prometheus metrics are on port `9091`
 inside the container (including `whisperlive_backlog_seconds`); publish it in `docker-compose.yml` if you want to scrape it.
 
 ## Test bench
@@ -262,6 +333,16 @@ With `sensevoice`, a language outside `en`, `ja`, `zh`, `yue`, `ko` is detected 
 
 **`501` from `/v1/audio/transcriptions`.**
 That REST endpoint only exists with the `faster_whisper` backend. For SenseVoice use the WebSocket on port 9090.
+
+**`Cannot reach Redis` / `Connection refused` on port 6379, or `python -m pytest gateway` skips the Redis tests.**
+Start it: `docker compose up -d redis`, then `docker compose exec redis redis-cli ping` should answer `PONG`.
+
+**`OOM command not allowed when used memory > 'maxmemory'` from Redis.**
+Redis hit its cap (`REDIS_MAXMEMORY`). Feeds are trimmed, so this means something is writing far more than expected, or a very large message; look at `docker compose exec redis redis-cli info memory` and `xlen final-text`.
+Raise `REDIS_MAXMEMORY` and `REDIS_MEM` together if the load is real.
+
+**A service restarted and I expected old messages, but it only saw new ones.**
+A new consumer group starts at the end of the feed. Use `start="0"` when creating it to read what the feed still holds. A group that already exists always continues from where it stopped.
 
 **The container is up but `/ready` stays 503 for a long time.**
 It is loading the model; SenseVoice takes a few seconds on a warm disk, longer the first time the model files are read. `docker compose logs engine` shows `Loading SenseVoice model` and then `Model warm-up took ...`.
