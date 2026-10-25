@@ -16,6 +16,7 @@ The target design is in `Real-Time Transcription HLD.pdf`, and the build order i
 | Part | Status |
 |---|---|
 | Speech engine (Docker): swappable model (SenseVoice-Small or faster-whisper), preload, `/ready`, backlog meter, seat limit | Built |
+| Live microphone through the engine (the WhisperLive client, see "Live microphone") | Works |
 | Test bench: real-time replay, WER / CER, delays | Built ([bench/](bench/)) |
 | Redis message board, session gateway, web app, Caddy, monitoring, translation | Not built yet (plan.md phases 3 to 9) |
 
@@ -80,11 +81,43 @@ python bench/replay.py path/to/audio.wav --language ja
 
 ### Live microphone
 
+**Start the live pipeline** (works from a cold start; on WSL2 do the microphone setup below once first):
+
 ```bash
-python WhisperLive/run_client.py --server localhost --port 9090 --lang en
+# 1. Start the engine and wait until it is ready: 503 while the model loads, 200 when it is warm
+docker compose up -d engine
+curl -i localhost:8000/ready
+
+# 2. In the environment where the client is installed, speak and watch the text appear
+source .venv/bin/activate
+python WhisperLive/run_client.py --server localhost --port 9090 --lang en --enable_timestamps --n_display_segments 6
 ```
 
-Draft text updates about once a second and finished sentences are kept. Stop with Ctrl+C.
+For Japanese use `--lang ja` (SenseVoice also takes `zh`, `yue` and `ko`). Stop with **Ctrl+C**, not by closing the terminal: that saves the transcript as `output.srt` in the folder you ran it from.
+The client prints `* recording`, then `Server Ready!`, and then the text block starts updating.
+
+What you should see: a draft appears within about a second of you starting to speak and is rewritten as you go on (it can change words as more audio arrives).
+A sentence stays a draft until you pause or the next one starts, so the last sentence you say may take a few seconds to settle after you stop.
+On WSL2 the microphone can take a couple of seconds to start delivering audio, so give it a moment after `Server Ready!` before you speak.
+
+**A one-minute check, in English and in Japanese.** Run the command twice, once per language, for about a minute each, and add `--save_output_recording --output_file ./live_en.wav`
+(and `./live_ja.wav` for Japanese) to keep what the microphone heard:
+
+```bash
+python WhisperLive/run_client.py --server localhost --port 9090 --lang en --enable_timestamps --n_display_segments 6 \
+    --save_output_recording --output_file ./live_en.wav
+python WhisperLive/run_client.py --server localhost --port 9090 --lang ja --enable_timestamps --n_display_segments 6 \
+    --save_output_recording --output_file ./live_ja.wav
+```
+
+Speak naturally with pauses between sentences, and include a few numbers and names. Things worth noticing:
+
+- How soon the first words appear, and how far the draft trails behind you while you speak.
+- Whether finished sentences are right, and what goes wrong (names, numbers, short words, English words inside Japanese).
+- What happens in pauses and when you stop (does the last sentence settle?).
+- Whether your headset microphone, not the laptop's, is the one being used (see the setup below).
+
+A saved recording can be replayed through the engine as many times as you like, with timing, using `python bench/replay.py live_en.wav --language en`.
 
 On WSL2 the microphone comes from Windows through WSLg:
 
@@ -95,7 +128,7 @@ On WSL2 the microphone comes from Windows through WSLg:
    echo 'export PULSE_SERVER=unix:/mnt/wslg/PulseServer' >> ~/.bashrc
    printf 'pcm.!default { type pulse }\nctl.!default { type pulse }\n' > ~/.asoundrc
    ```
-4. Check: `pactl list short sources` shows a source, and `parecord --channels=1 /tmp/t.wav` then `paplay /tmp/t.wav` plays your voice back.
+4. Check: `pactl list short sources` shows a source (`RDPSource` is the Windows microphone), and `parecord --channels=1 /tmp/t.wav` then `paplay /tmp/t.wav` plays your voice back.
 5. If you change the default device in Windows, run `wsl --shutdown` and reopen the terminal.
 
 The ALSA and JACK lines printed at start are noise from missing sound cards; they are harmless as long as the client says `* recording` and does not print `Unable to access microphone`.
@@ -207,6 +240,13 @@ An older container is using the port. `docker ps`, then `docker rm -f <name>` (f
 
 **`run_client.py: error: unrecognized arguments: --host`.**
 The option is `--server`, not `--host`.
+
+**The client says `* recording` but no text ever appears.**
+Check that the engine is ready (`curl localhost:8000/ready` is 200) and that the microphone really records: `parecord --channels=1 /tmp/t.wav`, speak, Ctrl+C, then `paplay /tmp/t.wav`.
+If the playback is silent, the Windows microphone is muted, not the default input, or blocked in Windows privacy settings. Also check `--lang` matches what you are saying.
+
+**The first words I said are missing.**
+On WSL2 the microphone can take a couple of seconds to start delivering audio. Wait a moment after `Server Ready!` before speaking.
 
 **`Unable to access microphone`, `no default output device`, or `Unanticipated host error` with `overrun`.**
 Follow the WSL2 microphone steps above. In file mode add `--mute_audio_playback`. An overrun at the start usually means the engine was still loading; start the client after `/ready` is 200.

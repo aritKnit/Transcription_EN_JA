@@ -61,6 +61,11 @@ Normally the engine's chunk restarts after each finished sentence, which hides t
 2. [ ] Re-run the client-VAD experiment on the branch after that. Merge it only if it then at least matches the no-gate run.
 3. The web app (Phase 5) would need its own browser copy of the gate; the experiment's sent-time map and 600 ms tail rule would carry over.
 
+## Phase 2e: Live audio check `[~]`
+See the pipeline run on live audio before building more around it.
+1. [x] Instructions to start the live pipeline and run a one-minute check: [README.md](README.md), "Live microphone". Capture path checked with a virtual microphone in English (no extra delay beyond the file replays).
+2. [ ] One minute of real speech in English and one in Japanese through the microphone (the person running it), saving the recordings with `--save_output_recording`; then replay them through the bench and note what goes wrong.
+
 ## Phase 3: Redis and the message board `[ ]`
 - `redis:7` in Compose, append-only file, volume.
 - Streams `final-text` and `translations`, with consumer groups.

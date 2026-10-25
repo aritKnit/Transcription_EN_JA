@@ -2,6 +2,15 @@
 
 Changelog of what has been built, newest first. The sequence and status of each phase is in [plan.md](plan.md).
 
+## Live audio check and how to run it (2026-10-25)
+
+Goal: see the pipeline run on live audio before starting Phase 3.
+
+- [README.md](README.md), "Live microphone": start-to-finish steps for the live pipeline (start the engine, wait for `/ready`, run the client), a plan for a one-minute English and a one-minute Japanese check with `--save_output_recording` so the recording can be replayed through the bench afterwards, what to look at, and two new troubleshooting entries (no text appears; first words missing). The live client is the existing `WhisperLive/run_client.py`; no code changed.
+- What I checked myself: the live capture path with a virtual PulseAudio microphone (a null sink on the WSLg Pulse server, recorded by PyAudio through its monitor), English passage `en_01`, a few runs. The microphone client received the transcript and showed it; the text matched the reference except the first word ("MS" came out as "It" or was missing in every run; I did not find out why). With a temporary timing script (not kept in the repo) the newest text was a median 0.39 s behind the audio (95% under 0.77 s), the first text appeared 0.61 s after speech began, a sentence was marked finished about 3 s after it ended, and the engine backlog stayed under 1 s. That matches the file replays (draft lag 0.45 s median), so the live capture path adds no measurable delay of its own.
+- Found: with WSLg the microphone stream started delivering audio about 2.0 s after it was opened, hence the "wait a moment" note. My first timing run counted that start-up as lag (2.3 s median); starting the clock at the first audio fixed it.
+- Not checked by me: a real microphone (a person speaking) and the Japanese live path; the one-minute English and Japanese check is yours to run. The virtual microphone I created was removed afterwards.
+
 ## Model-agnostic engine and SenseVoice-Small (2026-10-24)
 
 Goal: make the speech model a setting and use FunAudioLLM's SenseVoice-Small.
