@@ -1,5 +1,6 @@
-# Speech engine only: faster-whisper path of WhisperLive. torch is installed separately (CPU build).
+# Speech engine: the faster_whisper and sensevoice backends of WhisperLive. torch and torchaudio are installed separately (CPU build).
 faster-whisper==1.2.0
+funasr==1.4.16
 onnxruntime>=1.20.0,<2
 numpy>=1.26.4,<2.5
 scipy

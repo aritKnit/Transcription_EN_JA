@@ -10,6 +10,8 @@ WORKDIR /app
 
 # CPU-only torch, without the nvidia libraries
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+# torchaudio is needed by FunASR (SenseVoice); same CPU index so it matches torch
+RUN pip install torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 COPY engine/requirements.txt /app/
 RUN pip install -r requirements.txt && rm requirements.txt

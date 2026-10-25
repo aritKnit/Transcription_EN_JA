@@ -1,8 +1,12 @@
 # Real-time transcription service
 
-A live speech-to-text service built on [WhisperLive](WhisperLive/) (faster-whisper, INT8, CPU only).
+A live speech-to-text service built on [WhisperLive](WhisperLive/), CPU only.
 Audio goes in over a WebSocket; draft text and finished sentences come back as you speak.
-English and Japanese are the tested languages; any language the Whisper model supports works.
+The speech model is a setting, not part of the design: the engine runs either
+[SenseVoice-Small](https://huggingface.co/FunAudioLLM/SenseVoiceSmall) (the default) or any
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) Whisper model, and everything around it
+(client, bench, and the gateway and web app to come) speaks the same WebSocket protocol for both.
+English and Japanese are the tested languages. How the models compare is in [results.md](results.md).
 
 The target design is in `Real-Time Transcription HLD.pdf`, and the build order is in [plan.md](plan.md).
 [updates.md](updates.md) lists what has changed so far.
@@ -11,7 +15,7 @@ The target design is in `Real-Time Transcription HLD.pdf`, and the build order i
 
 | Part | Status |
 |---|---|
-| Speech engine (Docker): model preload, `/ready`, backlog meter, seat limit | Built |
+| Speech engine (Docker): swappable model (SenseVoice-Small or faster-whisper), preload, `/ready`, backlog meter, seat limit | Built |
 | Test bench: real-time replay, WER / CER, delays | Built ([bench/](bench/)) |
 | Redis message board, session gateway, web app, Caddy, monitoring, translation | Not built yet (plan.md phases 3 to 9) |
 
@@ -21,9 +25,9 @@ There is no browser page yet.
 ## Requirements
 
 - Docker with Compose v2. On Windows, Docker Desktop with the WSL2 backend.
-- About 6 GB of RAM for the engine at the default settings (it is capped at 2 GB; Docker itself needs more).
+- About 6 GB of RAM. The engine is capped at 3 GB by default (SenseVoice needs about 2 GB; a faster-whisper `base` model about 1 GB).
 - Python 3.10 or newer on the host, only for the client and the bench.
-- Disk: about 2.2 GB for the engine image, plus the model (about 150 MB for `base`).
+- Disk: a few GB for the engine image (PyTorch and FunASR are large), plus the model (SenseVoice-Small about 0.9 GB, faster-whisper `base` about 150 MB).
 
 ## Setup
 
@@ -33,12 +37,12 @@ git clone <this repo> && cd Whisper
 # 1. Settings (model folder, seats, threads, CPU and memory caps)
 cp .env.example .env
 
-# 2. Put a model in models/<MODEL_DIR>. This one is multilingual (English, Japanese, ...)
+# 2. Put a model in models/<MODEL_DIR> (the default is SenseVoice-Small, about 0.9 GB)
 python3 -m venv .venv && source .venv/bin/activate
 pip install huggingface_hub
-python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-base', local_dir='models/base-v1')"
+python -c "from huggingface_hub import snapshot_download; snapshot_download('FunAudioLLM/SenseVoiceSmall', local_dir='models/sensevoice-small-v1')"
 
-# 3. Build and start the engine (the first build downloads about 1 GB and can take 15 to 25 minutes)
+# 3. Build and start the engine (the first build downloads PyTorch and FunASR and can take 20 to 30 minutes)
 docker compose up -d --build engine
 
 # 4. Wait until it is ready (503 while the model loads, 200 when warm)
@@ -46,9 +50,7 @@ curl -i localhost:8000/ready
 curl localhost:8000/health
 ```
 
-`.env` points `MODEL_DIR` at the folder under `models/`. To change the model, put a new CTranslate2 model in
-another folder (for example `models/small-v1`), set `MODEL_DIR=small-v1` and run `docker compose up -d engine`.
-To roll back, set it back. Old folders are never touched.
+`.env` holds `BACKEND` (which kind of model) and `MODEL_DIR` (which folder under `models/`). See "Choosing a model" below to switch.
 
 Install the client tools on the host:
 
@@ -67,6 +69,7 @@ python WhisperLive/run_client.py --server localhost --port 9090 --lang en \
 ```
 
 Use `--lang ja` for Japanese. The engine uses the model from `.env`, so the client's `--model` option does not matter here.
+With SenseVoice, `--lang` can be `en`, `ja`, `zh`, `yue` or `ko`; any other value means automatic language detection.
 `--mute_audio_playback` stops the client from playing the file out loud (needed on WSL2, which has no sound card).
 
 To see timing as well, replay the file at real speed with the bench client; it prints each update with its arrival time:
@@ -125,16 +128,47 @@ For any other source (a meeting app's audio, a capture card, your own code), ope
 
 A single engine has one seat by default, so one live stream at a time. Sessions end after `MAX_CONNECTION_TIME` seconds (one hour by default).
 
+## Choosing a model
+
+The engine loads one model at start and keeps it warm. Which one is decided by two settings in `.env`:
+
+| `BACKEND` | `MODEL_DIR` example | Model | Languages | Notes |
+|---|---|---|---|---|
+| `sensevoice` (default) | `sensevoice-small-v1` | [FunAudioLLM/SenseVoiceSmall](https://huggingface.co/FunAudioLLM/SenseVoiceSmall), run with FunASR | `en`, `ja`, `zh`, `yue`, `ko` | Much more accurate than Whisper `base` on the test set and keeps up in real time ([results.md](results.md)). No translation, no word timestamps. Licence: FunASR Model License (commercial use allowed with attribution) |
+| `faster_whisper` | `base-v1` | Any CTranslate2 Whisper model, run with faster-whisper (INT8) | All Whisper languages | Also serves the OpenAI-style REST endpoint `/v1/audio/transcriptions` on port 8000 |
+
+To switch, change both settings and restart the engine. The model folder must already be in `models/`:
+
+```bash
+# faster-whisper example
+python -c "from huggingface_hub import snapshot_download; snapshot_download('Systran/faster-whisper-base', local_dir='models/base-v1')"
+# then in .env: BACKEND=faster_whisper  and  MODEL_DIR=base-v1
+docker compose up -d engine
+curl localhost:8000/health        # shows the backend and model the engine is running
+```
+
+To roll back, set them back; old model folders are never touched. Clients, the bench and the WebSocket protocol do not change.
+
+**How it works.** SenseVoice is not a streaming model, so the engine cuts the incoming audio into speech pieces with Silero VAD and runs the model on the
+current sentence over and over as it grows; this is why drafts update word by word and why it is fast enough to keep up. Whisper models go through
+the same loop with faster-whisper's own decoding. Both produce the same JSON segments (`start`, `end`, `text`, `completed`).
+
+**Adding another model.** A backend is one file in [WhisperLive/whisper_live/backend/](WhisperLive/whisper_live/backend/) that subclasses `ServeClientBase` and
+implements `transcribe_audio` (audio in, segments with `start`, `end`, `text` out) and `handle_transcription_output`.
+[sensevoice_backend.py](WhisperLive/whisper_live/backend/sensevoice_backend.py) is the shortest example. Then register it: add a value to `BackendType` and a branch in `initialize_client`
+and in the `--preload` step of [server.py](WhisperLive/whisper_live/server.py), and add its dependencies to [engine/requirements.txt](engine/requirements.txt).
+
 ## Settings (`.env`)
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `MODEL_DIR` | `base-v1` | Folder under `models/` the engine loads |
+| `BACKEND` | `sensevoice` | `sensevoice` or `faster_whisper` |
+| `MODEL_DIR` | `sensevoice-small-v1` | Folder under `models/` the engine loads |
 | `MAX_CLIENTS` | `1` | Seats. Raise to 2 only after the two-stream test passes |
 | `MAX_CONNECTION_TIME` | `3600` | Longest session, in seconds |
 | `ENGINE_THREADS` | `4` | CPU threads used by the model |
 | `ENGINE_CPUS` | `4` | CPU cap for the container |
-| `ENGINE_MEM` | `2g` | Memory cap for the container |
+| `ENGINE_MEM` | `3g` | Memory cap for the container |
 
 Ports (bound to `127.0.0.1` only): `9090` WebSocket audio, `8000` `/health` and `/ready`. Prometheus metrics are on port `9091`
 inside the container (including `whisperlive_backlog_seconds`); publish it in `docker-compose.yml` if you want to scrape it.
@@ -148,6 +182,8 @@ python bench/prepare.py                  # builds 10 English and 10 Japanese rec
 python bench/run_bench.py --tag mytest   # about 40 minutes for 3 repeats
 ```
 
+Measured results for each model are in [results.md](results.md).
+
 ## Troubleshooting
 
 **`426 Upgrade Required` / `invalid Connection header: keep-alive` in the engine log.**
@@ -158,8 +194,10 @@ The engine opens the audio port only after the model is loaded and warm. Wait fo
 If it never does: `docker compose logs engine`.
 
 **Container keeps restarting (`docker compose ps` shows `Restarting`).**
-Read `docker compose logs engine`. The usual causes: `MODEL_DIR` points at a folder that does not exist or is not a CTranslate2 model
-(it needs `model.bin`, `config.json`, `tokenizer.json`), or the container was killed for memory (exit code 137): raise `ENGINE_MEM` or use a smaller model.
+Read `docker compose logs engine`. The usual causes:
+- `MODEL_DIR` points at a folder that does not exist, or `BACKEND` does not match the folder. `sensevoice` needs the files from `FunAudioLLM/SenseVoiceSmall`
+  (`model.pt`, `config.yaml`, `am.mvn`, ...); `faster_whisper` needs a CTranslate2 model (`model.bin`, `config.json`, `tokenizer.json`).
+- The container was killed for memory (exit code 137, check with `docker inspect`): raise `ENGINE_MEM`.
 
 **Client prints `WAIT` or the bench says "engine is full".**
 All seats are taken. Close the other session, or wait; the message carries the minutes until the oldest session times out.
@@ -174,12 +212,19 @@ The option is `--server`, not `--host`.
 Follow the WSL2 microphone steps above. In file mode add `--mute_audio_playback`. An overrun at the start usually means the engine was still loading; start the client after `/ready` is 200.
 
 **Text is delayed or very behind.**
-The model is too big for the CPU. Look at `docker stats`; if the engine sits at its CPU cap, use a smaller model (`tiny` or `base`) or raise `ENGINE_CPUS` and `ENGINE_THREADS` together.
+The model is too big for the CPU. Look at `docker stats`; if the engine sits at its CPU cap, raise `ENGINE_CPUS` and `ENGINE_THREADS` together, or with `faster_whisper` use a smaller model (`tiny` or `base`).
 Check the backlog: `curl localhost:8000/health` shows `backlog_seconds`. Near 0 is healthy; a number that keeps growing means the engine cannot keep up.
 
 **Wrong or poor transcription.**
 Use a clear headset microphone (a Bluetooth headset in hands-free mode only gives telephone quality). Set `--lang` to the language being spoken.
-Do not use a `.en` model for Japanese. Small models make more mistakes in Japanese than in English; try `small` and compare with the bench.
+With `faster_whisper`, do not use a `.en` model for Japanese; small Whisper models make many more mistakes in Japanese than in English (see [results.md](results.md)).
+With `sensevoice`, a language outside `en`, `ja`, `zh`, `yue`, `ko` is detected automatically and may be wrong; only those five are supported.
+
+**`501` from `/v1/audio/transcriptions`.**
+That REST endpoint only exists with the `faster_whisper` backend. For SenseVoice use the WebSocket on port 9090.
+
+**The container is up but `/ready` stays 503 for a long time.**
+It is loading the model; SenseVoice takes a few seconds on a warm disk, longer the first time the model files are read. `docker compose logs engine` shows `Loading SenseVoice model` and then `Model warm-up took ...`.
 
 **First `docker compose build` takes very long.**
-It downloads torch and the Python packages. Later builds reuse the cache; a code-only change rebuilds in seconds.
+It downloads PyTorch, torchaudio and FunASR with its dependencies. Later builds reuse the cache; a code-only change rebuilds in seconds.

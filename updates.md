@@ -2,6 +2,18 @@
 
 Changelog of what has been built, newest first. The sequence and status of each phase is in [plan.md](plan.md).
 
+## Model-agnostic engine and SenseVoice-Small (2026-10-24)
+
+Goal: make the speech model a setting and use FunAudioLLM's SenseVoice-Small.
+
+- New backend [sensevoice_backend.py](WhisperLive/whisper_live/backend/sensevoice_backend.py): FunASR runs the original `FunAudioLLM/SenseVoiceSmall` weights; Silero VAD cuts each audio chunk into speech pieces, SenseVoice recognises each piece, and the shared base loop turns them into drafts and finished segments. Model tags such as `<|ja|><|EMO_UNKNOWN|>` are stripped. One model is shared by all clients and loaded once.
+- [server.py](WhisperLive/whisper_live/server.py): `sensevoice` added to `BackendType`, a client branch in `initialize_client`, `--preload` and `/ready` work for it, and `/v1/audio/transcriptions` returns 501 unless the backend is `faster_whisper`. [run_server.py](WhisperLive/run_server.py): new generic `--model_path` (the old `-fw` still works).
+- Engine image: `torchaudio` (CPU build, same index as torch) and `funasr==1.4.16` added; image is now about 3 GB. [docker-compose.yml](docker-compose.yml) and [.env.example](.env.example) choose the model with `BACKEND` and `MODEL_DIR`; default is `sensevoice` / `sensevoice-small-v1`, memory cap raised to 3 GB (the container peaked near 2.4 GiB).
+- Tests: [test_sensevoice_backend.py](WhisperLive/tests/test_sensevoice_backend.py) (tag stripping, language mapping, segment building, preload, handshake, load failure) and two server tests (REST 501, model folder required).
+- **Measured ([results.md](results.md), Run 2):** English WER 12.05% to 6.83% and Japanese CER 30.22% to 10.72% against the faster-whisper `base` baseline; draft lag about halved; backlog never above 2 s (was up to 13 s).
+- Client-side VAD (a gate that sends only speech) was built and measured on a separate branch, `experiment/client-vad`, and is not part of this branch; see Phase 2c in [plan.md](plan.md) for the result and the engine-side problem it uncovered.
+- [results.md](results.md) is new: it holds the baseline (moved from `bench/BASELINE.md`) and the two runs above. [README.md](README.md) now explains how to choose a model, how to add another backend, and the client-side VAD.
+
 ## Phase 2: test bench and baseline (2026-10-24)
 
 Goal: measure accuracy and delay of the engine alone, in real time, for English and Japanese.
@@ -11,7 +23,7 @@ Goal: measure accuracy and delay of the engine alone, in real time, for English 
 - [bench/score.py](bench/score.py): builds the transcript, computes WER (English) and CER (Japanese) with normalisation, and the delays: first draft, draft lag, finished-segment delay.
 - [bench/run_bench.py](bench/run_bench.py): runs the whole set several times and writes raw events and a summary table to `bench/results/` (git-ignored). Scoring can be redone from the raw events with `score.py`.
 - Added a draft-lag metric after the first smoke run showed that "final delay" mostly measures WhisperLive's rule that a sentence is finished only when the next one starts.
-- Baseline, `base` model, one seat ([bench/BASELINE.md](bench/BASELINE.md)): English 12.05% WER, Japanese 30.22% CER; median draft lag about 1 s but the backlog reaches 13 s on some long sentences.
+- Baseline, `base` model, one seat ([results.md](results.md)): English 12.05% WER, Japanese 30.22% CER; median draft lag about 1 s but the backlog reaches 13 s on some long sentences.
 - [README.md](README.md): setup, usage (files, microphone, RTSP/HLS and raw WebSocket streams), settings and troubleshooting.
 - `.gitignore`: ignores `bench/data/` (downloaded FLEURS files).
 

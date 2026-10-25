@@ -897,6 +897,22 @@ class TestHealthEndpoint(unittest.TestCase):
             },
         )
 
+    def test_transcriptions_endpoint_is_not_available_for_sensevoice(self):
+        import io
+        from fastapi.testclient import TestClient
+
+        server = TranscriptionServer()
+        server.client_manager = ClientManager(max_clients=1, max_connection_time=60)
+        client = TestClient(server.build_rest_app("sensevoice"))
+        resp = client.post("/v1/audio/transcriptions", files={"file": ("a.wav", io.BytesIO(b"x"), "audio/wav")})
+        self.assertEqual(resp.status_code, 501)
+        self.assertIn("faster_whisper", resp.json()["error"])
+        self.assertEqual(client.get("/health").json()["backend"], "sensevoice")
+
+    def test_sensevoice_server_needs_a_model_folder(self):
+        with self.assertRaises(ValueError):
+            TranscriptionServer().run("127.0.0.1", port=0, backend="sensevoice")
+
     def test_ready_is_503_until_the_model_is_warm(self):
         client = self._make_client()
         resp = client.get("/ready")

@@ -19,10 +19,14 @@ if __name__ == "__main__":
     parser.add_argument('--backend', '-b',
                         type=str,
                         default='faster_whisper',
-                        help='Backends from ["tensorrt", "faster_whisper", "openvino"]')
+                        help='Backends from ["tensorrt", "faster_whisper", "openvino", "sensevoice"]')
     parser.add_argument('--faster_whisper_custom_model_path', '-fw',
                         type=str, default=None,
                         help="Custom Faster Whisper Model")
+    parser.add_argument('--model_path', '-mp',
+                        type=str, default=None,
+                        help="Model folder for the faster_whisper or sensevoice backend. "
+                             "For faster_whisper this is the same as --faster_whisper_custom_model_path.")
     parser.add_argument('--trt_model_path', '-trt',
                         type=str,
                         default=None,
@@ -123,6 +127,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    model_path = args.model_path or args.faster_whisper_custom_model_path
+    if args.backend == "sensevoice" and model_path is None:
+        raise ValueError("The sensevoice backend needs a model folder: --model_path")
+
     if args.backend == "tensorrt":
         if args.trt_model_path is None:
             raise ValueError("Please Provide a valid tensorrt model path")
@@ -136,7 +144,7 @@ if __name__ == "__main__":
         "0.0.0.0",
         port=args.port,
         backend=args.backend,
-        faster_whisper_custom_model_path=args.faster_whisper_custom_model_path,
+        faster_whisper_custom_model_path=model_path,
         whisper_tensorrt_path=args.trt_model_path,
         trt_multilingual=args.trt_multilingual,
         trt_py_session=args.trt_py_session,

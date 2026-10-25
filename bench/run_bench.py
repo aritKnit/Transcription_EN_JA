@@ -9,6 +9,7 @@ import argparse
 import csv
 import json
 import time
+import urllib.request
 from pathlib import Path
 
 import score
@@ -34,8 +35,12 @@ def main():
         manifest = [row for lang in args.languages
                     for row in [m for m in manifest if m["lang"] == lang][: args.limit]]
 
+    with urllib.request.urlopen(args.health_url, timeout=5) as response:
+        engine = json.load(response)
     run_dir = ROOT / "results" / f"{time.strftime('%Y%m%d-%H%M%S')}-{args.tag}"
     run_dir.mkdir(parents=True)
+    (run_dir / "engine.json").write_text(json.dumps(engine, indent=2))
+    print(f"engine: backend {engine['backend']}, model {engine['model']}", flush=True)
     runs = []
     with open(run_dir / "runs.jsonl", "w", encoding="utf-8") as out:
         for repeat in range(args.repeats):

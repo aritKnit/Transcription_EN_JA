@@ -214,6 +214,7 @@ class BackendType(Enum):
     FASTER_WHISPER = "faster_whisper"
     TENSORRT = "tensorrt"
     OPENVINO = "openvino"
+    SENSEVOICE = "sensevoice"
 
     @staticmethod
     def valid_types() -> List[str]:
@@ -222,6 +223,9 @@ class BackendType(Enum):
     @staticmethod
     def is_valid(backend: str) -> bool:
         return backend in BackendType.valid_types()
+
+    def is_sensevoice(self) -> bool:
+        return self == BackendType.SENSEVOICE
 
     def is_faster_whisper(self) -> bool:
         return self == BackendType.FASTER_WHISPER
@@ -408,6 +412,22 @@ class TranscriptionServer:
                             )
                             worker.start()
                             ServeClientFasterWhisper.BATCH_WORKER = worker
+
+            elif self.backend.is_sensevoice():
+                from whisper_live.backend.sensevoice_backend import ServeClientSenseVoice
+                client = ServeClientSenseVoice(
+                    websocket,
+                    language=options["language"],
+                    client_uid=options["uid"],
+                    model=faster_whisper_custom_model_path,
+                    vad_parameters=options.get("vad_parameters"),
+                    send_last_n_segments=options.get("send_last_n_segments", 10),
+                    no_speech_thresh=options.get("no_speech_thresh", 0.45),
+                    clip_audio=options.get("clip_audio", False),
+                    same_output_threshold=options.get("same_output_threshold", 10),
+                    translation_queue=translation_queue,
+                )
+                logging.info("Running sensevoice backend.")
         except Exception as e:
             logging.error(e)
             return
@@ -907,6 +927,12 @@ class TranscriptionServer:
             stream: bool = Form(default=False),
             hotwords: Optional[str] = Form(default=None),
         ):
+            if backend != BackendType.FASTER_WHISPER.value:
+                return JSONResponse(
+                    {"error": f"/v1/audio/transcriptions is only available with the faster_whisper backend, "
+                              f"this server runs {backend}"},
+                    status_code=501,
+                )
             if stream:
                 return self._stream_transcription(
                     file, language, prompt, temperature,
@@ -1162,6 +1188,8 @@ class TranscriptionServer:
                 logging.info("Single model mode currently only works with custom models.")
         if not BackendType.is_valid(backend):
             raise ValueError(f"{backend} is not a valid backend type. Choose backend from {BackendType.valid_types()}")
+        if backend == BackendType.SENSEVOICE.value and not faster_whisper_custom_model_path:
+            raise ValueError("The sensevoice backend needs a model folder (--model_path).")
 
         # Start Prometheus metrics endpoint if port is specified
         if metrics_port > 0:
@@ -1191,8 +1219,12 @@ class TranscriptionServer:
             if backend == BackendType.FASTER_WHISPER.value and faster_whisper_custom_model_path:
                 from whisper_live.backend.faster_whisper_backend import ServeClientFasterWhisper
                 ServeClientFasterWhisper.preload(faster_whisper_custom_model_path, cache_path)
+            elif backend == BackendType.SENSEVOICE.value:
+                from whisper_live.backend.sensevoice_backend import ServeClientSenseVoice
+                ServeClientSenseVoice.preload(faster_whisper_custom_model_path)
             else:
-                logging.warning("--preload needs the faster_whisper backend and -fw; skipping.")
+                logging.warning("--preload needs a model folder (--model_path) with the faster_whisper "
+                                "or sensevoice backend; skipping.")
         self.ready.set()
 
         # Original WebSocket server (always supported)

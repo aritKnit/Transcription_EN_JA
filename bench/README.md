@@ -5,7 +5,8 @@ English is scored with WER and Japanese with CER (Japanese has no spaces, so cha
 
 ## Run it
 
-The engine must be up (`curl localhost:8000/ready` returns 200) and idle: the bench needs the one seat.
+The engine must be up (`curl localhost:8000/ready` returns 200) and idle: the bench needs the one seat. It talks only the WebSocket protocol, so it measures
+whichever model the engine runs (`BACKEND` and `MODEL_DIR` in `.env`); compare models by running it once per model.
 
 ```bash
 pip install -r bench/requirements.txt
@@ -16,7 +17,8 @@ python bench/replay.py bench/audio/en/en_00.wav --language en       # one record
 python bench/score.py bench/results/<run>     # re-score a finished run
 ```
 
-Results go to `bench/results/<time>-<tag>/` (git-ignored): `runs.jsonl` has every raw message with its arrival time, `summary.csv` the table.
+Results go to `bench/results/<time>-<tag>/` (git-ignored): `runs.jsonl` has every raw message with its arrival time, `summary.csv` the table,
+`engine.json` the backend and model the engine reported when the run started. Add the numbers you want to keep to [../results.md](../results.md).
 Scoring is separate from replaying, so you can change how things are scored without running the 40 minutes again.
 
 ## Test set

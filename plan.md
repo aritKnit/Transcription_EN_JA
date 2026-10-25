@@ -22,7 +22,7 @@ docker-compose.yml
 - Python 3.11 for every backend image (the HLD's choice).
 - Shared message shape (HLD page 4) is defined once in `gateway/schema.py` (Phase 3).
 - One `.env` per deployment, loaded with pydantic-settings; commit only `.env.example`.
-- SenseVoice backend is parked; the HLD uses faster-whisper INT8 only.
+- The speech model is a setting, not part of the design (`BACKEND` and `MODEL_DIR` in `.env`). The HLD names faster-whisper INT8; SenseVoice-Small (FunAudioLLM) is now the default because it scored far better in the bench (see [results.md](results.md)). Both run behind the same WebSocket protocol.
 
 ## Phase 1: Speech engine, measured alone `[x]`
 Goal: one container that loads a model from the model store at start, warms it up, says when it is ready, and exposes a backlog meter.
@@ -43,7 +43,23 @@ How to run it: `cp .env.example .env`, `docker compose up -d engine`, then `curl
 - Log timestamps for first draft, draft lag and finished segments. Score English WER and Japanese CER (jiwer), three repeats, mean and std (pandas, scipy). Japanese replaced Mandarin as the second language.
 - Test set: 10 recordings per language (3 FLEURS sentences each) with reference text.
 
-Check (passed): baseline in [bench/BASELINE.md](bench/BASELINE.md): English 12.05% WER, Japanese 30.22% CER with the `base` model; the engine falls behind on some long sentences (backlog up to 13 s). Every later change is compared against these.
+Check (passed): baseline in [results.md](results.md): English 12.05% WER, Japanese 30.22% CER with the faster-whisper `base` model; the engine falls behind on some long sentences (backlog up to 13 s). Every later change is compared against these.
+
+## Phase 2b: Model-agnostic engine `[x]`
+Goal: the model is a setting. Switching it changes nothing outside the engine.
+1. [x] Backend selected by `BACKEND` in `.env`; model folder by `MODEL_DIR`. `--model_path` works for every backend.
+2. [x] `sensevoice` backend (FunAudioLLM/SenseVoiceSmall through FunASR): Silero VAD cuts speech pieces, SenseVoice recognises them, the shared loop turns them into drafts and finished segments.
+3. [x] Preload and `/ready` work for both backends; `/v1/audio/transcriptions` answers 501 unless the backend is `faster_whisper`.
+4. [x] Full bench run for SenseVoice in Docker, same protocol as the baseline ([results.md](results.md), Run 2): English WER 6.83% (was 12.05%), Japanese CER 10.72% (was 30.22%), backlog never above 2 s.
+
+## Phase 2c: Client-side VAD, experimental `[~]` (not in main)
+The client-side VAD (a gate that sends only speech) was built and measured on a separate branch, `experiment/client-vad`; it is not part of `main`.
+Result there: it sent 28% (English) and 41% (Japanese) less audio, but accuracy got worse (WER 6.83% to 8.15%, CER 10.72% to 13.42%) and the engine's load did not drop.
+Cause, which also concerns `main`: the engine's own speech detection (`get_speech_timestamps`, Silero over the whole current chunk in one pass) misses quiet sentences that follow loud ones; offline it misses more than 1 s of speech in 4 of the 20 test recordings, with or without the gate.
+Normally the engine's chunk restarts after each finished sentence, which hides this.
+1. [ ] Engine side (`main`): make the SenseVoice backend's speech detection restart after silence instead of carrying Silero's state through the whole chunk, then re-run the bench (Run 2 should not get worse and may get better).
+2. [ ] Re-run the client-VAD experiment on the branch after that. Merge it only if it then at least matches the no-gate run.
+3. The web app (Phase 5) would need its own browser copy of the gate; the experiment's sent-time map and 600 ms tail rule would carry over.
 
 ## Phase 3: Redis and the message board `[ ]`
 - `redis:7` in Compose, append-only file, volume.
